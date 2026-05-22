@@ -1,4 +1,5 @@
 finance-datareader
+html5lib
 pandas
 python-dotenv
 ta

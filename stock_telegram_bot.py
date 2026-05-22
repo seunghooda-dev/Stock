@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -28,6 +29,20 @@ MAX_REPORTS = 20
 REQUEST_DELAY_SECONDS = 0.15
 FUNDAMENTAL_CACHE_DAYS = 7
 
+# Market regime filter
+MARKET_INDEX_CODE = "KS11"
+MARKET_REGIME_LOOKBACK_DAYS = 320
+MARKET_REGIME_MA = 200
+MAX_RELATIVE_VOLATILITY = 1.10
+
+# Smart money accumulation filter
+ENABLE_SMART_MONEY_FILTER = True
+ACCUMULATION_LOOKBACK_DAYS = 20
+ACCUMULATION_PAGES = 5
+MIN_ACCUMULATION_RATIO = 0.001
+MIN_ACCUMULATION_POSITIVE_DAYS = 10
+MAX_SIDEWAYS_PRICE_CHANGE = 0.05
+
 # Financial filters
 MAX_DEBT_TO_EQUITY = 100.0
 MIN_CURRENT_RATIO = 150.0
@@ -38,8 +53,10 @@ REQUIRED_PROFIT_YEARS = 3
 RSI_WINDOW = 14
 MA_SHORT = 20
 MA_LONG = 60
-MIN_RSI = 50.0
-MAX_RSI = 75.0
+MIN_RSI = 40.0
+MAX_RSI = 55.0
+MA_SUPPORT_BAND = 0.03
+MAX_DISTANCE_ABOVE_MA20 = 0.08
 
 MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
@@ -60,6 +77,7 @@ class StockMeta:
     name: str
     market: str
     market_cap: Optional[float]
+    shares: Optional[float]
 
 
 @dataclass
@@ -81,7 +99,31 @@ class TechnicalSnapshot:
     rsi: float
     ma20: float
     ma60: float
+    volatility: float
+    market_volatility: float
     trend_summary: str
+
+
+@dataclass
+class AccumulationSnapshot:
+    days: int
+    foreign_net_buy: float
+    institutional_net_buy: float
+    combined_net_buy: float
+    net_buy_ratio: float
+    positive_days: int
+    price_change: float
+    summary: str
+
+
+@dataclass
+class MarketRegime:
+    index_code: str
+    current: float
+    ma200: float
+    volatility: float
+    risk_on: bool
+    summary: str
 
 
 @dataclass
@@ -89,6 +131,7 @@ class DiscoveryReport:
     stock: StockMeta
     financials: FinancialMetrics
     technicals: TechnicalSnapshot
+    accumulation: Optional[AccumulationSnapshot]
     reason: str
 
 
@@ -108,11 +151,12 @@ class FinancialScanner:
             name = str(row.Name).strip()
             market = str(row.Market).strip()
             market_cap = self._safe_float(getattr(row, "Marcap", None))
+            shares = self._safe_float(getattr(row, "Stocks", None))
 
             if not self._is_common_stock(name):
                 continue
 
-            stocks.append(StockMeta(code=code, name=name, market=market, market_cap=market_cap))
+            stocks.append(StockMeta(code=code, name=name, market=market, market_cap=market_cap, shares=shares))
 
         logger.info("재무 스캔 대상 종목 수: %d개", len(stocks))
         return stocks
@@ -310,6 +354,172 @@ class FinancialScanner:
             logger.warning("재무 캐시 저장 실패: %s", exc)
 
 
+class MarketRegimeFilter:
+    @property
+    def start_date(self) -> str:
+        return (datetime.now() - timedelta(days=MARKET_REGIME_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+
+    @property
+    def end_date(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def analyze(self) -> MarketRegime:
+        logger.info("Market Regime Filter: KOSPI 200일선 확인 시작")
+        data = fdr.DataReader(MARKET_INDEX_CODE, self.start_date, self.end_date)
+        if data.empty or "Close" not in data.columns:
+            raise RuntimeError("코스피 지수 데이터를 수집하지 못했습니다.")
+
+        close = data["Close"].dropna().astype(float)
+        if len(close) < MARKET_REGIME_MA:
+            raise RuntimeError("코스피 200일 이동평균 계산에 필요한 데이터가 부족합니다.")
+
+        current = float(close.iloc[-1])
+        ma200 = float(close.rolling(MARKET_REGIME_MA).mean().iloc[-1])
+        volatility = annualized_volatility(close)
+        risk_on = current >= ma200
+        summary = (
+            f"KOSPI {current:,.2f}, 200일선 {ma200:,.2f}, "
+            f"시장 변동성 {volatility * 100:.1f}%"
+        )
+        logger.info("%s, Risk-On=%s", summary, risk_on)
+        return MarketRegime(
+            index_code=MARKET_INDEX_CODE,
+            current=current,
+            ma200=ma200,
+            volatility=volatility,
+            risk_on=risk_on,
+            summary=summary,
+        )
+
+
+class AccumulationAnalyzer:
+    NAVER_URL = "https://finance.naver.com/item/frgn.naver"
+    USER_AGENT = "Mozilla/5.0"
+
+    def analyze(self, stock_meta: StockMeta) -> Optional[AccumulationSnapshot]:
+        if not stock_meta.shares or stock_meta.shares <= 0:
+            logger.warning("%s(%s) 상장주식수 데이터가 없어 수급 분석 제외", stock_meta.name, stock_meta.code)
+            return None
+
+        try:
+            investor_data = self._fetch_investor_data(stock_meta.code)
+            if len(investor_data) < ACCUMULATION_LOOKBACK_DAYS:
+                raise ValueError(f"20일 수급 분석에 필요한 데이터 부족: {len(investor_data)}일")
+
+            recent = investor_data.head(ACCUMULATION_LOOKBACK_DAYS).copy()
+            combined = recent["foreign_net_buy"] + recent["institutional_net_buy"]
+            combined_net_buy = float(combined.sum())
+            foreign_net_buy = float(recent["foreign_net_buy"].sum())
+            institutional_net_buy = float(recent["institutional_net_buy"].sum())
+            positive_days = int((combined > 0).sum())
+            net_buy_ratio = combined_net_buy / stock_meta.shares
+
+            latest_close = float(recent.iloc[0]["close"])
+            oldest_close = float(recent.iloc[-1]["close"])
+            if oldest_close <= 0:
+                raise ValueError("20일 전 종가가 0 이하입니다.")
+            price_change = latest_close / oldest_close - 1
+
+            if combined_net_buy <= 0:
+                return None
+            if net_buy_ratio < MIN_ACCUMULATION_RATIO:
+                return None
+            if positive_days < MIN_ACCUMULATION_POSITIVE_DAYS:
+                return None
+            if abs(price_change) > MAX_SIDEWAYS_PRICE_CHANGE:
+                return None
+
+            summary = (
+                f"최근 {ACCUMULATION_LOOKBACK_DAYS}일 외국인/기관 합산 순매수 "
+                f"{combined_net_buy:,.0f}주, 상장주식수 대비 {net_buy_ratio * 100:.2f}%, "
+                f"양수급 {positive_days}/{ACCUMULATION_LOOKBACK_DAYS}일"
+            )
+            return AccumulationSnapshot(
+                days=ACCUMULATION_LOOKBACK_DAYS,
+                foreign_net_buy=foreign_net_buy,
+                institutional_net_buy=institutional_net_buy,
+                combined_net_buy=combined_net_buy,
+                net_buy_ratio=net_buy_ratio,
+                positive_days=positive_days,
+                price_change=price_change,
+                summary=summary,
+            )
+        except Exception as exc:
+            logger.warning("%s(%s) 수급 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
+            return None
+
+    def _fetch_investor_data(self, code: str) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+
+        for page in range(1, ACCUMULATION_PAGES + 1):
+            response = requests.get(
+                self.NAVER_URL,
+                params={"code": code, "page": page},
+                headers={"User-Agent": self.USER_AGENT},
+                timeout=20,
+            )
+            response.raise_for_status()
+            tables = pd.read_html(StringIO(response.text))
+            table = self._find_investor_table(tables)
+            frames.append(table)
+            if sum(len(frame) for frame in frames) >= ACCUMULATION_LOOKBACK_DAYS:
+                break
+            time.sleep(0.05)
+
+        if not frames:
+            raise ValueError("네이버 수급 테이블을 찾지 못했습니다.")
+
+        data = pd.concat(frames, ignore_index=True)
+        data = data.drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
+        return data
+
+    def _find_investor_table(self, tables: List[pd.DataFrame]) -> pd.DataFrame:
+        for table in tables:
+            normalized = self._normalize_investor_columns(table)
+            required = {"date", "close", "institutional_net_buy", "foreign_net_buy"}
+            if required.issubset(normalized.columns):
+                normalized = normalized.dropna(subset=["date", "close", "institutional_net_buy", "foreign_net_buy"])
+                if not normalized.empty:
+                    return normalized
+        raise ValueError("외국인/기관 순매매 테이블을 찾지 못했습니다.")
+
+    @staticmethod
+    def _normalize_investor_columns(table: pd.DataFrame) -> pd.DataFrame:
+        table = table.copy()
+        flat_columns: List[str] = []
+        for column in table.columns:
+            if isinstance(column, tuple):
+                parts = [str(part) for part in column if str(part) != "nan"]
+                if len(parts) >= 2 and parts[0] != parts[-1]:
+                    flat_columns.append("_".join(parts))
+                else:
+                    flat_columns.append(parts[0] if parts else "")
+            else:
+                flat_columns.append(str(column))
+
+        table.columns = flat_columns
+        rename_map: Dict[str, str] = {}
+        for column in table.columns:
+            if column.startswith("날짜"):
+                rename_map[column] = "date"
+            elif column.startswith("종가"):
+                rename_map[column] = "close"
+            elif column.startswith("기관") and "순매매" in column:
+                rename_map[column] = "institutional_net_buy"
+            elif column.startswith("외국인") and "순매매" in column:
+                rename_map[column] = "foreign_net_buy"
+
+        table = table.rename(columns=rename_map)
+        keep_columns = [column for column in ["date", "close", "institutional_net_buy", "foreign_net_buy"] if column in table.columns]
+        table = table[keep_columns].copy()
+        if "date" in table.columns:
+            table["date"] = pd.to_datetime(table["date"], format="%Y.%m.%d", errors="coerce")
+        for column in ["close", "institutional_net_buy", "foreign_net_buy"]:
+            if column in table.columns:
+                table[column] = pd.to_numeric(table[column], errors="coerce")
+        return table
+
+
 class TechnicalAnalyzer:
     @property
     def start_date(self) -> str:
@@ -319,7 +529,7 @@ class TechnicalAnalyzer:
     def end_date(self) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
-    def analyze(self, stock_meta: StockMeta) -> Optional[TechnicalSnapshot]:
+    def analyze(self, stock_meta: StockMeta, market_regime: MarketRegime) -> Optional[TechnicalSnapshot]:
         try:
             data = fdr.DataReader(stock_meta.code, self.start_date, self.end_date)
             if data.empty:
@@ -349,25 +559,29 @@ class TechnicalAnalyzer:
             ma20 = float(latest["MA20"])
             ma60 = float(latest["MA60"])
             rsi = float(latest["RSI"])
+            volatility = annualized_volatility(prices["Close"])
             ma20_rising = ma20 > float(five_days_ago["MA20"])
-            above_ma20 = current_price > ma20
+            ma20_support = ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)
             medium_uptrend = ma20 > ma60
-            rsi_healthy = MIN_RSI <= rsi <= MAX_RSI
+            rsi_entry_zone = MIN_RSI <= rsi <= MAX_RSI
+            low_volatility = volatility <= market_regime.volatility * MAX_RELATIVE_VOLATILITY
 
-            if not (above_ma20 and ma20_rising and medium_uptrend and rsi_healthy):
+            if not (ma20_support and ma20_rising and medium_uptrend and rsi_entry_zone and low_volatility):
                 return None
 
             crossed_ma20 = float(previous["Close"]) <= float(previous["MA20"]) and current_price > ma20
             if crossed_ma20:
-                trend_summary = "20일 이동평균선 상향 돌파 중"
+                trend_summary = "RSI 진입권에서 20일 이동평균선 상향 돌파 중"
             else:
-                trend_summary = "20일선 위에서 60일선 대비 상승 추세 유지"
+                trend_summary = "RSI 40~55 구간에서 20일선 지지 확인"
 
             return TechnicalSnapshot(
                 current_price=current_price,
                 rsi=rsi,
                 ma20=ma20,
                 ma60=ma60,
+                volatility=volatility,
+                market_volatility=market_regime.volatility,
                 trend_summary=trend_summary,
             )
         except Exception as exc:
@@ -427,12 +641,20 @@ class FinancialHealthBot:
         token = TELEGRAM_TOKEN or os.getenv("TELEGRAM_TOKEN", "")
         chat_id = CHAT_ID or os.getenv("TELEGRAM_CHAT_ID", "")
         self.financial_scanner = FinancialScanner()
+        self.market_regime_filter = MarketRegimeFilter()
         self.technical_analyzer = TechnicalAnalyzer()
+        self.accumulation_analyzer = AccumulationAnalyzer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
 
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
         try:
+            market_regime = self.market_regime_filter.analyze()
+            if not market_regime.risk_on:
+                logger.info("Risk-Off 국면이므로 매수 후보 스캔을 중단합니다.")
+                self.notifier.send(self._build_risk_off_message(market_regime))
+                return
+
             universe = self.financial_scanner.fetch_universe()
             stock_map = {stock.code: stock for stock in universe}
             financially_strong = self.financial_scanner.scan(universe)
@@ -443,8 +665,12 @@ class FinancialHealthBot:
                 if stock_meta is None:
                     continue
 
-                technicals = self.technical_analyzer.analyze(stock_meta)
+                technicals = self.technical_analyzer.analyze(stock_meta, market_regime)
                 if technicals is None:
+                    continue
+
+                accumulation = self.accumulation_analyzer.analyze(stock_meta)
+                if ENABLE_SMART_MONEY_FILTER and accumulation is None:
                     continue
 
                 reports.append(
@@ -452,12 +678,13 @@ class FinancialHealthBot:
                         stock=stock_meta,
                         financials=metrics,
                         technicals=technicals,
+                        accumulation=accumulation,
                         reason=self._build_reason(metrics, technicals),
                     )
                 )
 
             reports = self._rank_reports(reports)[:MAX_REPORTS]
-            self.notifier.send(self._build_message(reports))
+            self.notifier.send(self._build_message(reports, market_regime))
             logger.info("재무 건전성 종목 발굴 작업 완료. 최종 후보: %d개", len(reports))
         except Exception as exc:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
@@ -469,6 +696,8 @@ class FinancialHealthBot:
             reports,
             key=lambda report: (
                 report.financials.pbr,
+                -((report.accumulation.net_buy_ratio if report.accumulation else 0.0)),
+                report.technicals.volatility,
                 report.financials.debt_to_equity,
                 -report.technicals.rsi,
             ),
@@ -482,28 +711,31 @@ class FinancialHealthBot:
         return (
             f"부채비율 {metrics.debt_to_equity:.1f}%와 유동비율 {metrics.current_ratio:.1f}%로 재무 안정성이 높고, "
             f"PBR {metrics.pbr:.2f}로 자산가치 대비 저평가 구간입니다. "
-            f"{margin_text}, {technicals.trend_summary}입니다."
+            f"{margin_text}, 시장보다 낮은 변동성과 {technicals.trend_summary}입니다."
         )
 
     @staticmethod
-    def _build_message(reports: List[DiscoveryReport]) -> str:
+    def _build_message(reports: List[DiscoveryReport], market_regime: MarketRegime) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
         if not reports:
             return (
                 f"📊 재무 건전성 알짜 기업 스캐너\n"
                 f"🗓 {today}\n\n"
-                "오늘은 재무 필터와 기술적 추세 조건을 모두 만족한 종목이 없습니다."
+                f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
+                "오늘은 재무, 저변동성, 수급, 기술적 타점 조건을 모두 만족한 종목이 없습니다."
             )
 
         lines = [
             "📊 재무 건전성 알짜 기업 스캐너",
             f"🗓 {today}",
+            f"🛡️ 시장 국면: {market_regime.summary} / Risk-On",
             f"✅ 최종 발굴 종목 {len(reports)}개",
         ]
 
         for report in reports:
             financials = report.financials
             technicals = report.technicals
+            accumulation = report.accumulation
             lines.extend(
                 [
                     "",
@@ -523,6 +755,12 @@ class FinancialHealthBot:
                         f"RSI {technicals.rsi:.1f}, "
                         f"20일선 {technicals.ma20:,.0f}원)"
                     ),
+                    (
+                        "📉 변동성: "
+                        f"종목 {technicals.volatility * 100:.1f}% / "
+                        f"시장 {technicals.market_volatility * 100:.1f}%"
+                    ),
+                    f"🏦 수급 매집: {format_accumulation(accumulation)}",
                     f"💡 추천 이유: {report.reason}",
                 ]
             )
@@ -535,6 +773,17 @@ class FinancialHealthBot:
         )
         return "\n".join(lines)
 
+    @staticmethod
+    def _build_risk_off_message(market_regime: MarketRegime) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        return (
+            "🛡️ Risk-Off 경고\n"
+            f"🗓 {today}\n\n"
+            f"{market_regime.summary}\n"
+            "코스피가 200일 이동평균선 아래에 있어 신규 매수 알림을 비활성화합니다.\n"
+            "현금 비중 확대와 보유 종목 리스크 점검이 우선입니다."
+        )
+
 
 def format_market_cap(value: Optional[float]) -> str:
     if value is None:
@@ -546,6 +795,23 @@ def format_optional_percent(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
     return f"{value:.1f}%"
+
+
+def format_accumulation(value: Optional[AccumulationSnapshot]) -> str:
+    if value is None:
+        return "N/A"
+    return (
+        f"{value.days}일 외국인/기관 합산 {value.combined_net_buy:,.0f}주 순매수, "
+        f"상장주식수 대비 {value.net_buy_ratio * 100:.2f}%, "
+        f"주가 변화 {value.price_change * 100:+.1f}%"
+    )
+
+
+def annualized_volatility(close: pd.Series) -> float:
+    returns = close.astype(float).pct_change().dropna()
+    if returns.empty:
+        return 0.0
+    return float(returns.tail(120).std() * (252 ** 0.5))
 
 
 def run_scheduled_job(bot: FinancialHealthBot) -> None:
