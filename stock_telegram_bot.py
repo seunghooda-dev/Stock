@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from datetime import datetime, timedelta
 from html import escape
@@ -12,9 +13,9 @@ from ta.trend import MACD
 from ta.momentum import RSIIndicator
 
 
-# Telegram settings: put your own values here.
-TELEGRAM_TOKEN = ""
-CHAT_ID = ""
+# Telegram settings: set these as environment variables before running.
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Bot settings
 RUN_TIME_KST = "16:00"

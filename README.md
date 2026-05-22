@@ -10,11 +10,11 @@ pip install -r requirements.txt
 
 ## 설정
 
-`stock_telegram_bot.py` 상단의 값을 입력하세요.
+텔레그램 토큰과 채팅 ID는 코드에 직접 넣지 말고 환경변수로 설정하세요.
 
-```python
-TELEGRAM_TOKEN = "텔레그램 봇 토큰"
-CHAT_ID = "텔레그램 채팅 ID"
+```powershell
+$env:TELEGRAM_TOKEN = "텔레그램 봇 토큰"
+$env:TELEGRAM_CHAT_ID = "텔레그램 채팅 ID"
 ```
 
 ## 실행
