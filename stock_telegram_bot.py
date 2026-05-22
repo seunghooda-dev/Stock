@@ -15,6 +15,7 @@ import schedule
 import yfinance as yf
 from dotenv import load_dotenv
 from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
 
 
 # Telegram settings: fill these directly, or set TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env vars.
@@ -28,6 +29,11 @@ MIN_HISTORY_DAYS = 80
 MAX_REPORTS = 20
 REQUEST_DELAY_SECONDS = 0.15
 FUNDAMENTAL_CACHE_DAYS = 7
+FAILURE_CACHE_DAYS = 3
+
+# Liquidity guardrails
+MIN_MARKET_CAP = 50_000_000_000
+MIN_DAILY_TRADING_VALUE = 500_000_000
 
 # Market regime filter
 MARKET_INDEX_CODE = "KS11"
@@ -51,6 +57,8 @@ REQUIRED_PROFIT_YEARS = 3
 
 # Technical filters
 RSI_WINDOW = 14
+ATR_WINDOW = 14
+ATR_STOP_MULTIPLIER = 2.0
 MA_SHORT = 20
 MA_LONG = 60
 MIN_RSI = 40.0
@@ -78,6 +86,7 @@ class StockMeta:
     market: str
     market_cap: Optional[float]
     shares: Optional[float]
+    trading_value: Optional[float]
 
 
 @dataclass
@@ -99,6 +108,8 @@ class TechnicalSnapshot:
     rsi: float
     ma20: float
     ma60: float
+    atr: float
+    stop_loss: float
     volatility: float
     market_volatility: float
     trend_summary: str
@@ -152,11 +163,23 @@ class FinancialScanner:
             market = str(row.Market).strip()
             market_cap = self._safe_float(getattr(row, "Marcap", None))
             shares = self._safe_float(getattr(row, "Stocks", None))
+            trading_value = self._safe_float(getattr(row, "Amount", None))
 
             if not self._is_common_stock(name):
                 continue
+            if not self._passes_liquidity_filter(market_cap, trading_value):
+                continue
 
-            stocks.append(StockMeta(code=code, name=name, market=market, market_cap=market_cap, shares=shares))
+            stocks.append(
+                StockMeta(
+                    code=code,
+                    name=name,
+                    market=market,
+                    market_cap=market_cap,
+                    shares=shares,
+                    trading_value=trading_value,
+                )
+            )
 
         logger.info("재무 스캔 대상 종목 수: %d개", len(stocks))
         return stocks
@@ -167,6 +190,7 @@ class FinancialScanner:
         for index, stock_meta in enumerate(stocks, start=1):
             if index % 100 == 0:
                 logger.info("재무 필터 진행률: %d/%d", index, len(stocks))
+                self._save_cache()
 
             metrics = self.fetch_financial_metrics(stock_meta)
             if metrics is None:
@@ -185,6 +209,8 @@ class FinancialScanner:
         cached = self._get_cached_metrics(stock_meta.code)
         if cached:
             return cached
+        if self._is_recent_failed_cache(stock_meta.code):
+            return None
 
         yahoo_symbol = self._to_yahoo_symbol(stock_meta)
         try:
@@ -245,6 +271,10 @@ class FinancialScanner:
             return metrics
         except Exception as exc:
             logger.warning("%s(%s) 재무 데이터 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
+            self.cache[stock_meta.code] = {
+                "cached_at": datetime.now().isoformat(timespec="seconds"),
+                "error": str(exc),
+            }
             return None
 
     def _passes_financial_filters(self, metrics: FinancialMetrics) -> bool:
@@ -270,6 +300,9 @@ class FinancialScanner:
             if datetime.now() - cached_at > timedelta(days=FUNDAMENTAL_CACHE_DAYS):
                 return None
 
+            if "metrics" not in item:
+                return None
+
             metrics = item["metrics"]
             return FinancialMetrics(
                 code=str(metrics["code"]),
@@ -284,6 +317,17 @@ class FinancialScanner:
             )
         except Exception:
             return None
+
+    def _is_recent_failed_cache(self, code: str) -> bool:
+        item = self.cache.get(code)
+        if not item or "error" not in item:
+            return False
+
+        try:
+            cached_at = datetime.fromisoformat(str(item["cached_at"]))
+            return datetime.now() - cached_at <= timedelta(days=FAILURE_CACHE_DAYS)
+        except Exception:
+            return False
 
     @staticmethod
     def _to_yahoo_symbol(stock_meta: StockMeta) -> str:
@@ -333,6 +377,14 @@ class FinancialScanner:
             return False
         preferred_share_suffixes = ("우", "우B", "1우", "1우B", "2우", "2우B", "3우", "3우B")
         return not name.endswith(preferred_share_suffixes)
+
+    @staticmethod
+    def _passes_liquidity_filter(market_cap: Optional[float], trading_value: Optional[float]) -> bool:
+        if market_cap is None or market_cap < MIN_MARKET_CAP:
+            return False
+        if trading_value is None or trading_value < MIN_DAILY_TRADING_VALUE:
+            return False
+        return True
 
     @staticmethod
     def _load_cache() -> Dict[str, Dict[str, object]]:
@@ -535,18 +587,24 @@ class TechnicalAnalyzer:
             if data.empty:
                 raise ValueError("가격 데이터가 비어 있습니다.")
 
-            required_columns = {"Close"}
+            required_columns = {"High", "Low", "Close"}
             missing_columns = required_columns - set(data.columns)
             if missing_columns:
                 raise ValueError(f"필수 가격 컬럼 누락: {', '.join(sorted(missing_columns))}")
 
-            prices = data[["Close"]].dropna().copy()
+            prices = data[["High", "Low", "Close"]].dropna().copy()
             if len(prices) < MIN_HISTORY_DAYS:
                 raise ValueError(f"분석에 필요한 가격 데이터 부족: {len(prices)}일")
 
             prices["MA20"] = prices["Close"].rolling(MA_SHORT).mean()
             prices["MA60"] = prices["Close"].rolling(MA_LONG).mean()
             prices["RSI"] = RSIIndicator(close=prices["Close"], window=RSI_WINDOW).rsi()
+            prices["ATR"] = AverageTrueRange(
+                high=prices["High"],
+                low=prices["Low"],
+                close=prices["Close"],
+                window=ATR_WINDOW,
+            ).average_true_range()
             prices = prices.dropna()
             if len(prices) < 6:
                 raise ValueError("이동평균/RSI 계산 후 데이터가 부족합니다.")
@@ -559,6 +617,8 @@ class TechnicalAnalyzer:
             ma20 = float(latest["MA20"])
             ma60 = float(latest["MA60"])
             rsi = float(latest["RSI"])
+            atr = float(latest["ATR"])
+            stop_loss = max(0.0, current_price - (ATR_STOP_MULTIPLIER * atr))
             volatility = annualized_volatility(prices["Close"])
             ma20_rising = ma20 > float(five_days_ago["MA20"])
             ma20_support = ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)
@@ -580,6 +640,8 @@ class TechnicalAnalyzer:
                 rsi=rsi,
                 ma20=ma20,
                 ma60=ma60,
+                atr=atr,
+                stop_loss=stop_loss,
                 volatility=volatility,
                 market_volatility=market_regime.volatility,
                 trend_summary=trend_summary,
@@ -741,6 +803,7 @@ class FinancialHealthBot:
                     "",
                     f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
                     f"💰 시가총액: {format_market_cap(financials.market_cap)}",
+                    f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}",
                     (
                         "📊 재무 핵심 지표: "
                         f"부채비율 {financials.debt_to_equity:.1f}%, "
@@ -754,6 +817,11 @@ class FinancialHealthBot:
                         f"(현재가 {technicals.current_price:,.0f}원, "
                         f"RSI {technicals.rsi:.1f}, "
                         f"20일선 {technicals.ma20:,.0f}원)"
+                    ),
+                    (
+                        "🛡️ 리스크 관리: "
+                        f"ATR {technicals.atr:,.0f}원 기준 손절선 "
+                        f"{technicals.stop_loss:,.0f}원"
                     ),
                     (
                         "📉 변동성: "
