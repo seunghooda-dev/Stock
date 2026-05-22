@@ -1,12 +1,14 @@
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from html import escape
 from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
 import schedule
-import yfinance as yf
+from pykrx import stock
+from ta.trend import MACD
 from ta.momentum import RSIIndicator
 
 
@@ -16,19 +18,24 @@ CHAT_ID = ""
 
 # Bot settings
 RUN_TIME_KST = "16:00"
-DATA_PERIOD = "6mo"
-DATA_INTERVAL = "1d"
+LOOKBACK_DAYS = 220
 RSI_WINDOW = 14
 MA_WINDOW = 20
 RSI_BUY_THRESHOLD = 30
 MA_PROXIMITY_RATE = 0.03
+FUNDAMENTAL_FILTER_ENABLED = True
+MAX_PER = 40
+MAX_PBR = 5
 
 STOCKS: Dict[str, str] = {
-    "8035.T": "도쿄일렉트론",
-    "6857.T": "어드반테스트",
-    "7203.T": "토요타",
-    "6758.T": "소니",
-    "9984.T": "소프트뱅크",
+    "005930": "삼성전자",
+    "000660": "SK하이닉스",
+    "035420": "NAVER",
+    "035720": "카카오",
+    "051910": "LG화학",
+    "005380": "현대차",
+    "068270": "셀트리온",
+    "247540": "에코프로비엠",
 }
 
 logging.basicConfig(
@@ -63,30 +70,39 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
+def get_date_range() -> tuple[str, str]:
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
+    return start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
+
+
+def normalize_ohlcv_columns(data: pd.DataFrame) -> pd.DataFrame:
+    column_map = {
+        "시가": "Open",
+        "고가": "High",
+        "저가": "Low",
+        "종가": "Close",
+        "거래량": "Volume",
+    }
+    data = data.rename(columns=column_map)
+    required_columns = ["Open", "High", "Low", "Close", "Volume"]
+    missing_columns = set(required_columns) - set(data.columns)
+    if missing_columns:
+        raise ValueError(f"필수 OHLCV 컬럼 누락: {', '.join(sorted(missing_columns))}")
+    return data[required_columns].sort_index()
+
+
 def fetch_stock_data(ticker: str) -> Optional[pd.DataFrame]:
-    """Fetch recent daily price data from Yahoo Finance."""
+    """Fetch recent KRX daily OHLCV data through pykrx."""
     try:
-        data = yf.download(
-            tickers=ticker,
-            period=DATA_PERIOD,
-            interval=DATA_INTERVAL,
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-        )
+        start_date, end_date = get_date_range()
+        data = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
 
         if data.empty:
-            raise ValueError(f"{ticker} 데이터가 비어 있습니다.")
+            raise ValueError(f"{ticker} OHLCV 데이터가 비어 있습니다.")
 
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-
-        required_columns = {"Close"}
-        missing_columns = required_columns - set(data.columns)
-        if missing_columns:
-            raise ValueError(f"{ticker} 필수 컬럼 누락: {', '.join(sorted(missing_columns))}")
-
-        data = data.dropna(subset=["Close"]).copy()
+        data = normalize_ohlcv_columns(data)
+        data = data.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
         if len(data) < MA_WINDOW + RSI_WINDOW:
             raise ValueError(f"{ticker} 분석에 필요한 데이터가 부족합니다. 현재 {len(data)}일")
 
@@ -97,27 +113,102 @@ def fetch_stock_data(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_fundamental_data(ticker: str) -> Dict[str, Optional[float]]:
+    """Fetch latest PER/PBR/EPS/BPS/DPS data through pykrx."""
+    try:
+        start_date, end_date = get_date_range()
+        data = stock.get_market_fundamental_by_date(start_date, end_date, ticker)
+
+        if data.empty:
+            raise ValueError(f"{ticker} 기본적 분석 데이터가 비어 있습니다.")
+
+        latest = data.dropna(how="all").iloc[-1]
+
+        bps = to_optional_float(latest.get("BPS"))
+        eps = to_optional_float(latest.get("EPS"))
+        roe = None
+        if bps and eps is not None:
+            roe = eps / bps * 100
+
+        return {
+            "per": to_optional_float(latest.get("PER")),
+            "pbr": to_optional_float(latest.get("PBR")),
+            "eps": eps,
+            "bps": bps,
+            "dps": to_optional_float(latest.get("DPS")),
+            "roe": roe,
+        }
+    except Exception as exc:
+        logging.exception("%s 기본적 분석 데이터 수집 실패: %s", ticker, exc)
+        return {
+            "per": None,
+            "pbr": None,
+            "eps": None,
+            "bps": None,
+            "dps": None,
+            "roe": None,
+        }
+
+
+def to_optional_float(value: object) -> Optional[float]:
+    try:
+        if pd.isna(value):
+            return None
+        number = float(value)
+        return number if number != 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def passes_fundamental_filter(fundamental: Dict[str, Optional[float]]) -> bool:
+    if not FUNDAMENTAL_FILTER_ENABLED:
+        return True
+
+    per = fundamental.get("per")
+    pbr = fundamental.get("pbr")
+    roe = fundamental.get("roe")
+
+    if per is None or per <= 0 or per > MAX_PER:
+        return False
+    if pbr is None or pbr <= 0 or pbr > MAX_PBR:
+        return False
+    if roe is not None and roe <= 0:
+        return False
+
+    return True
+
+
 def analyze_stock(ticker: str, name: str, data: pd.DataFrame) -> Optional[Dict[str, object]]:
     """Analyze one stock and return a buy candidate dict when conditions match."""
     try:
         close = data["Close"].astype(float)
         data["RSI"] = RSIIndicator(close=close, window=RSI_WINDOW).rsi()
         data["MA20"] = close.rolling(window=MA_WINDOW).mean()
+        macd = MACD(close=close)
+        data["MACD"] = macd.macd()
+        data["MACD_SIGNAL"] = macd.macd_signal()
 
-        latest = data.dropna(subset=["RSI", "MA20"]).iloc[-1]
-        previous = data.dropna(subset=["RSI", "MA20"]).iloc[-2]
+        latest = data.dropna(subset=["RSI", "MA20", "MACD", "MACD_SIGNAL"]).iloc[-1]
+        previous = data.dropna(subset=["RSI", "MA20", "MACD", "MACD_SIGNAL"]).iloc[-2]
 
         current_price = float(latest["Close"])
         previous_price = float(previous["Close"])
         rsi = float(latest["RSI"])
         ma20 = float(latest["MA20"])
         previous_ma20 = float(previous["MA20"])
+        volume = int(latest["Volume"])
+        macd_value = float(latest["MACD"])
+        macd_signal = float(latest["MACD_SIGNAL"])
 
         near_ma20 = abs(current_price - ma20) / ma20 <= MA_PROXIMITY_RATE
         breaking_ma20 = previous_price < previous_ma20 and current_price >= ma20
         oversold = rsi <= RSI_BUY_THRESHOLD
 
         if not (oversold and (near_ma20 or breaking_ma20)):
+            return None
+
+        fundamental = fetch_fundamental_data(ticker)
+        if not passes_fundamental_filter(fundamental):
             return None
 
         reason_parts: List[str] = [f"RSI {rsi:.1f}로 과매도 구간 진입"]
@@ -127,13 +218,19 @@ def analyze_stock(ticker: str, name: str, data: pd.DataFrame) -> Optional[Dict[s
             reason_parts.append("20일 이동평균선 지지 확인")
         else:
             reason_parts.append("20일 이동평균선 근접")
+        if macd_value >= macd_signal:
+            reason_parts.append("MACD 회복 신호")
 
         return {
             "ticker": ticker,
             "name": name,
             "current_price": current_price,
+            "volume": volume,
             "rsi": rsi,
             "ma20": ma20,
+            "macd": macd_value,
+            "macd_signal": macd_signal,
+            "fundamental": fundamental,
             "reason": " 및 ".join(reason_parts),
         }
     except Exception as exc:
@@ -142,32 +239,47 @@ def analyze_stock(ticker: str, name: str, data: pd.DataFrame) -> Optional[Dict[s
         return None
 
 
+def format_metric(value: Optional[float], suffix: str = "", digits: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:,.{digits}f}{suffix}"
+
+
 def build_recommendation_message(recommendations: List[Dict[str, object]]) -> str:
     today = datetime.now().strftime("%Y-%m-%d")
 
     if not recommendations:
         return (
-            f"📊 <b>일본 주요 종목 매수 추천 리포트</b>\n"
+            f"📊 <b>국내 주요 종목 매수 추천 리포트</b>\n"
             f"🗓 {today}\n\n"
             "오늘은 조건에 부합하는 추천 종목이 없습니다."
         )
 
     lines = [
-        "📊 <b>일본 주요 종목 매수 추천 리포트</b>",
+        "📊 <b>국내 주요 종목 매수 추천 리포트</b>",
         f"🗓 {today}",
         "",
         "✅ <b>매수 추천 후보</b>",
     ]
 
     for item in recommendations:
+        fundamental = item["fundamental"]
         lines.extend(
             [
                 "",
-                f"🚀 <b>{item['name']} ({item['ticker']})</b>",
-                f"💴 현재가: {item['current_price']:,.0f} JPY",
+                f"🚀 <b>{escape(str(item['name']))} ({item['ticker']})</b>",
+                f"💰 현재가: {item['current_price']:,.0f} KRW",
+                f"📦 거래량: {item['volume']:,}주",
                 f"📉 RSI: {item['rsi']:.1f}",
-                f"📈 20일 MA: {item['ma20']:,.0f} JPY",
-                f"🧠 추천 이유: {item['reason']}",
+                f"📈 20일 MA: {item['ma20']:,.0f} KRW",
+                f"📊 MACD: {item['macd']:.2f} / Signal {item['macd_signal']:.2f}",
+                (
+                    "🏢 기본지표: "
+                    f"PER {format_metric(fundamental.get('per'), digits=2)}, "
+                    f"PBR {format_metric(fundamental.get('pbr'), digits=2)}, "
+                    f"ROE {format_metric(fundamental.get('roe'), '%', digits=2)}"
+                ),
+                f"🧠 추천 이유: {escape(str(item['reason']))}",
             ]
         )
 
