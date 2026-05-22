@@ -1,340 +1,574 @@
+import json
 import logging
 import os
 import time
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from html import escape
+from pathlib import Path
 from typing import Dict, List, Optional
 
+import FinanceDataReader as fdr
 import pandas as pd
 import requests
 import schedule
-from pykrx import stock
-from ta.trend import MACD
+import yfinance as yf
+from dotenv import load_dotenv
 from ta.momentum import RSIIndicator
 
 
-# Telegram settings: set these as environment variables before running.
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Telegram settings: fill these directly, or set TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env vars.
+TELEGRAM_TOKEN = ""
+CHAT_ID = ""
 
-# Bot settings
+# Scanner settings
 RUN_TIME_KST = "16:00"
 LOOKBACK_DAYS = 220
-RSI_WINDOW = 14
-MA_WINDOW = 20
-RSI_BUY_THRESHOLD = 30
-MA_PROXIMITY_RATE = 0.03
-FUNDAMENTAL_FILTER_ENABLED = True
-MAX_PER = 40
-MAX_PBR = 5
+MIN_HISTORY_DAYS = 80
+MAX_REPORTS = 20
+REQUEST_DELAY_SECONDS = 0.15
+FUNDAMENTAL_CACHE_DAYS = 7
 
-STOCKS: Dict[str, str] = {
-    "005930": "삼성전자",
-    "000660": "SK하이닉스",
-    "035420": "NAVER",
-    "035720": "카카오",
-    "051910": "LG화학",
-    "005380": "현대차",
-    "068270": "셀트리온",
-    "247540": "에코프로비엠",
-}
+# Financial filters
+MAX_DEBT_TO_EQUITY = 100.0
+MIN_CURRENT_RATIO = 150.0
+MAX_PBR = 1.5
+REQUIRED_PROFIT_YEARS = 3
+
+# Technical filters
+RSI_WINDOW = 14
+MA_SHORT = 20
+MA_LONG = 60
+MIN_RSI = 50.0
+MAX_RSI = 75.0
+
+MARKETS = {"KOSPI", "KOSDAQ"}
+EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
+CACHE_DIR = Path("cache")
+FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logger = logging.getLogger("financial-health-scanner")
 
 
-def send_telegram_message(message: str) -> bool:
-    """Send a message to Telegram. Returns False instead of raising."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        logging.warning("TELEGRAM_TOKEN 또는 CHAT_ID가 비어 있어 텔레그램 전송을 건너뜁니다.")
-        logging.info("전송 예정 메시지:\n%s", message)
-        return False
+@dataclass
+class StockMeta:
+    code: str
+    name: str
+    market: str
+    market_cap: Optional[float]
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
 
-    try:
-        response = requests.post(url, data=payload, timeout=15)
-        response.raise_for_status()
-        logging.info("텔레그램 메시지 전송 완료")
+@dataclass
+class FinancialMetrics:
+    code: str
+    name: str
+    yahoo_symbol: str
+    debt_to_equity: float
+    current_ratio: float
+    pbr: float
+    operating_income_years: List[float]
+    operating_margin: Optional[float]
+    market_cap: Optional[float]
+
+
+@dataclass
+class TechnicalSnapshot:
+    current_price: float
+    rsi: float
+    ma20: float
+    ma60: float
+    trend_summary: str
+
+
+@dataclass
+class DiscoveryReport:
+    stock: StockMeta
+    financials: FinancialMetrics
+    technicals: TechnicalSnapshot
+    reason: str
+
+
+class FinancialScanner:
+    def __init__(self) -> None:
+        self.cache: Dict[str, Dict[str, object]] = self._load_cache()
+
+    def fetch_universe(self) -> List[StockMeta]:
+        logger.info("KOSPI/KOSDAQ 전종목 목록 수집 시작")
+        listing = fdr.StockListing("KRX")
+        listing = listing[listing["Market"].isin(MARKETS)].copy()
+        listing = listing.dropna(subset=["Code", "Name", "Market"])
+
+        stocks: List[StockMeta] = []
+        for row in listing.itertuples(index=False):
+            code = str(row.Code).zfill(6)
+            name = str(row.Name).strip()
+            market = str(row.Market).strip()
+            market_cap = self._safe_float(getattr(row, "Marcap", None))
+
+            if not self._is_common_stock(name):
+                continue
+
+            stocks.append(StockMeta(code=code, name=name, market=market, market_cap=market_cap))
+
+        logger.info("재무 스캔 대상 종목 수: %d개", len(stocks))
+        return stocks
+
+    def scan(self, stocks: List[StockMeta]) -> List[FinancialMetrics]:
+        passed: List[FinancialMetrics] = []
+
+        for index, stock_meta in enumerate(stocks, start=1):
+            if index % 100 == 0:
+                logger.info("재무 필터 진행률: %d/%d", index, len(stocks))
+
+            metrics = self.fetch_financial_metrics(stock_meta)
+            if metrics is None:
+                continue
+
+            if self._passes_financial_filters(metrics):
+                passed.append(metrics)
+
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        logger.info("재무 필터 통과 종목 수: %d개", len(passed))
+        self._save_cache()
+        return passed
+
+    def fetch_financial_metrics(self, stock_meta: StockMeta) -> Optional[FinancialMetrics]:
+        cached = self._get_cached_metrics(stock_meta.code)
+        if cached:
+            return cached
+
+        yahoo_symbol = self._to_yahoo_symbol(stock_meta)
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+            balance_sheet = ticker.balance_sheet
+            financials = ticker.financials
+
+            if balance_sheet.empty:
+                raise ValueError("yfinance balance_sheet 데이터가 비어 있습니다.")
+            if financials.empty:
+                raise ValueError("yfinance financials 데이터가 비어 있습니다.")
+
+            latest_balance = balance_sheet.iloc[:, 0]
+            total_liabilities = self._get_statement_value(
+                latest_balance,
+                ["Total Liabilities Net Minority Interest", "Total Debt"],
+            )
+            equity = self._get_statement_value(
+                latest_balance,
+                ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"],
+            )
+            current_assets = self._get_statement_value(latest_balance, ["Current Assets"])
+            current_liabilities = self._get_statement_value(latest_balance, ["Current Liabilities"])
+
+            if not equity or equity <= 0:
+                raise ValueError("자본총계가 없거나 0 이하입니다.")
+            if not current_liabilities or current_liabilities <= 0:
+                raise ValueError("유동부채가 없거나 0 이하입니다.")
+
+            debt_to_equity = total_liabilities / equity * 100
+            current_ratio = current_assets / current_liabilities * 100
+            market_cap = stock_meta.market_cap or self._safe_float(ticker.get_info().get("marketCap"))
+            if not market_cap or market_cap <= 0:
+                raise ValueError("시가총액 데이터가 없습니다.")
+
+            pbr = market_cap / equity
+            operating_income_years = self._get_recent_operating_income(financials, REQUIRED_PROFIT_YEARS)
+            revenue = self._get_latest_financial_value(financials, ["Total Revenue", "Operating Revenue"])
+            operating_margin = None
+            if revenue and revenue > 0:
+                operating_margin = operating_income_years[0] / revenue * 100
+
+            metrics = FinancialMetrics(
+                code=stock_meta.code,
+                name=stock_meta.name,
+                yahoo_symbol=yahoo_symbol,
+                debt_to_equity=debt_to_equity,
+                current_ratio=current_ratio,
+                pbr=pbr,
+                operating_income_years=operating_income_years,
+                operating_margin=operating_margin,
+                market_cap=market_cap,
+            )
+            self.cache[stock_meta.code] = {
+                "cached_at": datetime.now().isoformat(timespec="seconds"),
+                "metrics": asdict(metrics),
+            }
+            return metrics
+        except Exception as exc:
+            logger.warning("%s(%s) 재무 데이터 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
+            return None
+
+    def _passes_financial_filters(self, metrics: FinancialMetrics) -> bool:
+        if metrics.debt_to_equity >= MAX_DEBT_TO_EQUITY:
+            return False
+        if metrics.current_ratio < MIN_CURRENT_RATIO:
+            return False
+        if metrics.pbr >= MAX_PBR:
+            return False
+        if len(metrics.operating_income_years) < REQUIRED_PROFIT_YEARS:
+            return False
+        if not all(value > 0 for value in metrics.operating_income_years[:REQUIRED_PROFIT_YEARS]):
+            return False
         return True
-    except requests.RequestException as exc:
-        logging.exception("텔레그램 메시지 전송 실패: %s", exc)
-        return False
 
-
-def get_date_range() -> tuple[str, str]:
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
-    return start_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d")
-
-
-def normalize_ohlcv_columns(data: pd.DataFrame) -> pd.DataFrame:
-    column_map = {
-        "시가": "Open",
-        "고가": "High",
-        "저가": "Low",
-        "종가": "Close",
-        "거래량": "Volume",
-    }
-    data = data.rename(columns=column_map)
-    required_columns = ["Open", "High", "Low", "Close", "Volume"]
-    missing_columns = set(required_columns) - set(data.columns)
-    if missing_columns:
-        raise ValueError(f"필수 OHLCV 컬럼 누락: {', '.join(sorted(missing_columns))}")
-    return data[required_columns].sort_index()
-
-
-def fetch_stock_data(ticker: str) -> Optional[pd.DataFrame]:
-    """Fetch recent KRX daily OHLCV data through pykrx."""
-    try:
-        start_date, end_date = get_date_range()
-        data = stock.get_market_ohlcv_by_date(start_date, end_date, ticker)
-
-        if data.empty:
-            raise ValueError(f"{ticker} OHLCV 데이터가 비어 있습니다.")
-
-        data = normalize_ohlcv_columns(data)
-        data = data.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
-        if len(data) < MA_WINDOW + RSI_WINDOW:
-            raise ValueError(f"{ticker} 분석에 필요한 데이터가 부족합니다. 현재 {len(data)}일")
-
-        return data
-    except Exception as exc:
-        logging.exception("%s 데이터 수집 실패: %s", ticker, exc)
-        send_telegram_message(f"⚠️ <b>{ticker} 데이터 수집 오류</b>\n{exc}")
-        return None
-
-
-def fetch_fundamental_data(ticker: str) -> Dict[str, Optional[float]]:
-    """Fetch latest PER/PBR/EPS/BPS/DPS data through pykrx."""
-    try:
-        start_date, end_date = get_date_range()
-        data = stock.get_market_fundamental_by_date(start_date, end_date, ticker)
-
-        if data.empty:
-            raise ValueError(f"{ticker} 기본적 분석 데이터가 비어 있습니다.")
-
-        latest = data.dropna(how="all").iloc[-1]
-
-        bps = to_optional_float(latest.get("BPS"))
-        eps = to_optional_float(latest.get("EPS"))
-        roe = None
-        if bps and eps is not None:
-            roe = eps / bps * 100
-
-        return {
-            "per": to_optional_float(latest.get("PER")),
-            "pbr": to_optional_float(latest.get("PBR")),
-            "eps": eps,
-            "bps": bps,
-            "dps": to_optional_float(latest.get("DPS")),
-            "roe": roe,
-        }
-    except Exception as exc:
-        logging.exception("%s 기본적 분석 데이터 수집 실패: %s", ticker, exc)
-        return {
-            "per": None,
-            "pbr": None,
-            "eps": None,
-            "bps": None,
-            "dps": None,
-            "roe": None,
-        }
-
-
-def to_optional_float(value: object) -> Optional[float]:
-    try:
-        if pd.isna(value):
-            return None
-        number = float(value)
-        return number if number != 0 else None
-    except (TypeError, ValueError):
-        return None
-
-
-def passes_fundamental_filter(fundamental: Dict[str, Optional[float]]) -> bool:
-    if not FUNDAMENTAL_FILTER_ENABLED:
-        return True
-
-    per = fundamental.get("per")
-    pbr = fundamental.get("pbr")
-    roe = fundamental.get("roe")
-
-    if per is None or per <= 0 or per > MAX_PER:
-        return False
-    if pbr is None or pbr <= 0 or pbr > MAX_PBR:
-        return False
-    if roe is not None and roe <= 0:
-        return False
-
-    return True
-
-
-def analyze_stock(ticker: str, name: str, data: pd.DataFrame) -> Optional[Dict[str, object]]:
-    """Analyze one stock and return a buy candidate dict when conditions match."""
-    try:
-        close = data["Close"].astype(float)
-        data["RSI"] = RSIIndicator(close=close, window=RSI_WINDOW).rsi()
-        data["MA20"] = close.rolling(window=MA_WINDOW).mean()
-        macd = MACD(close=close)
-        data["MACD"] = macd.macd()
-        data["MACD_SIGNAL"] = macd.macd_signal()
-
-        latest = data.dropna(subset=["RSI", "MA20", "MACD", "MACD_SIGNAL"]).iloc[-1]
-        previous = data.dropna(subset=["RSI", "MA20", "MACD", "MACD_SIGNAL"]).iloc[-2]
-
-        current_price = float(latest["Close"])
-        previous_price = float(previous["Close"])
-        rsi = float(latest["RSI"])
-        ma20 = float(latest["MA20"])
-        previous_ma20 = float(previous["MA20"])
-        volume = int(latest["Volume"])
-        macd_value = float(latest["MACD"])
-        macd_signal = float(latest["MACD_SIGNAL"])
-
-        near_ma20 = abs(current_price - ma20) / ma20 <= MA_PROXIMITY_RATE
-        breaking_ma20 = previous_price < previous_ma20 and current_price >= ma20
-        oversold = rsi <= RSI_BUY_THRESHOLD
-
-        if not (oversold and (near_ma20 or breaking_ma20)):
+    def _get_cached_metrics(self, code: str) -> Optional[FinancialMetrics]:
+        item = self.cache.get(code)
+        if not item:
             return None
 
-        fundamental = fetch_fundamental_data(ticker)
-        if not passes_fundamental_filter(fundamental):
+        try:
+            cached_at = datetime.fromisoformat(str(item["cached_at"]))
+            if datetime.now() - cached_at > timedelta(days=FUNDAMENTAL_CACHE_DAYS):
+                return None
+
+            metrics = item["metrics"]
+            return FinancialMetrics(
+                code=str(metrics["code"]),
+                name=str(metrics["name"]),
+                yahoo_symbol=str(metrics["yahoo_symbol"]),
+                debt_to_equity=float(metrics["debt_to_equity"]),
+                current_ratio=float(metrics["current_ratio"]),
+                pbr=float(metrics["pbr"]),
+                operating_income_years=[float(value) for value in metrics["operating_income_years"]],
+                operating_margin=self._safe_float(metrics.get("operating_margin")),
+                market_cap=self._safe_float(metrics.get("market_cap")),
+            )
+        except Exception:
             return None
 
-        reason_parts: List[str] = [f"RSI {rsi:.1f}로 과매도 구간 진입"]
-        if breaking_ma20:
-            reason_parts.append("20일 이동평균선 돌파 시도")
-        elif current_price >= ma20:
-            reason_parts.append("20일 이동평균선 지지 확인")
-        else:
-            reason_parts.append("20일 이동평균선 근접")
-        if macd_value >= macd_signal:
-            reason_parts.append("MACD 회복 신호")
+    @staticmethod
+    def _to_yahoo_symbol(stock_meta: StockMeta) -> str:
+        suffix = ".KQ" if stock_meta.market == "KOSDAQ" else ".KS"
+        return f"{stock_meta.code}{suffix}"
 
-        return {
-            "ticker": ticker,
-            "name": name,
-            "current_price": current_price,
-            "volume": volume,
-            "rsi": rsi,
-            "ma20": ma20,
-            "macd": macd_value,
-            "macd_signal": macd_signal,
-            "fundamental": fundamental,
-            "reason": " 및 ".join(reason_parts),
-        }
-    except Exception as exc:
-        logging.exception("%s 분석 실패: %s", ticker, exc)
-        send_telegram_message(f"⚠️ <b>{name}({ticker}) 분석 오류</b>\n{exc}")
+    @staticmethod
+    def _get_statement_value(series: pd.Series, candidates: List[str]) -> float:
+        for candidate in candidates:
+            if candidate in series.index:
+                value = FinancialScanner._safe_float(series.get(candidate))
+                if value is not None:
+                    return value
+        raise ValueError(f"재무제표 항목을 찾지 못했습니다: {', '.join(candidates)}")
+
+    @staticmethod
+    def _get_recent_operating_income(financials: pd.DataFrame, count: int) -> List[float]:
+        for row_name in ["Operating Income", "Total Operating Income As Reported", "EBIT"]:
+            if row_name in financials.index:
+                values = financials.loc[row_name].dropna().tolist()
+                values = [float(value) for value in values if pd.notna(value)]
+                if len(values) >= count:
+                    return values[:count]
+        raise ValueError("3년 영업이익 데이터를 찾지 못했습니다.")
+
+    @staticmethod
+    def _get_latest_financial_value(financials: pd.DataFrame, candidates: List[str]) -> Optional[float]:
+        for candidate in candidates:
+            if candidate in financials.index:
+                values = financials.loc[candidate].dropna()
+                if not values.empty:
+                    return FinancialScanner._safe_float(values.iloc[0])
         return None
 
+    @staticmethod
+    def _safe_float(value: object) -> Optional[float]:
+        try:
+            if value is None or pd.isna(value):
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
-def format_metric(value: Optional[float], suffix: str = "", digits: int = 2) -> str:
-    if value is None:
-        return "N/A"
-    return f"{value:,.{digits}f}{suffix}"
+    @staticmethod
+    def _is_common_stock(name: str) -> bool:
+        if any(keyword in name for keyword in EXCLUDE_NAME_KEYWORDS):
+            return False
+        preferred_share_suffixes = ("우", "우B", "1우", "1우B", "2우", "2우B", "3우", "3우B")
+        return not name.endswith(preferred_share_suffixes)
+
+    @staticmethod
+    def _load_cache() -> Dict[str, Dict[str, object]]:
+        if not FUNDAMENTAL_CACHE_FILE.exists():
+            return {}
+        try:
+            with FUNDAMENTAL_CACHE_FILE.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except Exception as exc:
+            logger.warning("재무 캐시 로드 실패: %s", exc)
+            return {}
+
+    def _save_cache(self) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with FUNDAMENTAL_CACHE_FILE.open("w", encoding="utf-8") as file:
+                json.dump(self.cache, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("재무 캐시 저장 실패: %s", exc)
 
 
-def build_recommendation_message(recommendations: List[Dict[str, object]]) -> str:
-    today = datetime.now().strftime("%Y-%m-%d")
+class TechnicalAnalyzer:
+    @property
+    def start_date(self) -> str:
+        return (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
 
-    if not recommendations:
-        return (
-            f"📊 <b>국내 주요 종목 매수 추천 리포트</b>\n"
-            f"🗓 {today}\n\n"
-            "오늘은 조건에 부합하는 추천 종목이 없습니다."
+    @property
+    def end_date(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def analyze(self, stock_meta: StockMeta) -> Optional[TechnicalSnapshot]:
+        try:
+            data = fdr.DataReader(stock_meta.code, self.start_date, self.end_date)
+            if data.empty:
+                raise ValueError("가격 데이터가 비어 있습니다.")
+
+            required_columns = {"Close"}
+            missing_columns = required_columns - set(data.columns)
+            if missing_columns:
+                raise ValueError(f"필수 가격 컬럼 누락: {', '.join(sorted(missing_columns))}")
+
+            prices = data[["Close"]].dropna().copy()
+            if len(prices) < MIN_HISTORY_DAYS:
+                raise ValueError(f"분석에 필요한 가격 데이터 부족: {len(prices)}일")
+
+            prices["MA20"] = prices["Close"].rolling(MA_SHORT).mean()
+            prices["MA60"] = prices["Close"].rolling(MA_LONG).mean()
+            prices["RSI"] = RSIIndicator(close=prices["Close"], window=RSI_WINDOW).rsi()
+            prices = prices.dropna()
+            if len(prices) < 6:
+                raise ValueError("이동평균/RSI 계산 후 데이터가 부족합니다.")
+
+            latest = prices.iloc[-1]
+            previous = prices.iloc[-2]
+            five_days_ago = prices.iloc[-6]
+
+            current_price = float(latest["Close"])
+            ma20 = float(latest["MA20"])
+            ma60 = float(latest["MA60"])
+            rsi = float(latest["RSI"])
+            ma20_rising = ma20 > float(five_days_ago["MA20"])
+            above_ma20 = current_price > ma20
+            medium_uptrend = ma20 > ma60
+            rsi_healthy = MIN_RSI <= rsi <= MAX_RSI
+
+            if not (above_ma20 and ma20_rising and medium_uptrend and rsi_healthy):
+                return None
+
+            crossed_ma20 = float(previous["Close"]) <= float(previous["MA20"]) and current_price > ma20
+            if crossed_ma20:
+                trend_summary = "20일 이동평균선 상향 돌파 중"
+            else:
+                trend_summary = "20일선 위에서 60일선 대비 상승 추세 유지"
+
+            return TechnicalSnapshot(
+                current_price=current_price,
+                rsi=rsi,
+                ma20=ma20,
+                ma60=ma60,
+                trend_summary=trend_summary,
+            )
+        except Exception as exc:
+            logger.warning("%s(%s) 기술적 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
+            return None
+
+
+class Notifier:
+    MAX_MESSAGE_LENGTH = 3900
+
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.token = token
+        self.chat_id = chat_id
+
+    def send(self, message: str) -> None:
+        if not self.token or not self.chat_id:
+            logger.warning("TELEGRAM_TOKEN 또는 CHAT_ID가 비어 있어 텔레그램 전송을 건너뜁니다.")
+            logger.info("전송 예정 메시지:\n%s", message)
+            return
+
+        for chunk in self._split_message(message):
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                data={
+                    "chat_id": self.chat_id,
+                    "text": chunk,
+                    "disable_web_page_preview": True,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+
+        logger.info("텔레그램 메시지 전송 완료")
+
+    def _split_message(self, message: str) -> List[str]:
+        if len(message) <= self.MAX_MESSAGE_LENGTH:
+            return [message]
+
+        chunks: List[str] = []
+        current = ""
+        for line in message.splitlines():
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > self.MAX_MESSAGE_LENGTH:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+
+class FinancialHealthBot:
+    def __init__(self) -> None:
+        load_dotenv()
+        token = TELEGRAM_TOKEN or os.getenv("TELEGRAM_TOKEN", "")
+        chat_id = CHAT_ID or os.getenv("TELEGRAM_CHAT_ID", "")
+        self.financial_scanner = FinancialScanner()
+        self.technical_analyzer = TechnicalAnalyzer()
+        self.notifier = Notifier(token=token, chat_id=chat_id)
+
+    def run_once(self) -> None:
+        logger.info("재무 건전성 종목 발굴 작업 시작")
+        try:
+            universe = self.financial_scanner.fetch_universe()
+            stock_map = {stock.code: stock for stock in universe}
+            financially_strong = self.financial_scanner.scan(universe)
+
+            reports: List[DiscoveryReport] = []
+            for metrics in financially_strong:
+                stock_meta = stock_map.get(metrics.code)
+                if stock_meta is None:
+                    continue
+
+                technicals = self.technical_analyzer.analyze(stock_meta)
+                if technicals is None:
+                    continue
+
+                reports.append(
+                    DiscoveryReport(
+                        stock=stock_meta,
+                        financials=metrics,
+                        technicals=technicals,
+                        reason=self._build_reason(metrics, technicals),
+                    )
+                )
+
+            reports = self._rank_reports(reports)[:MAX_REPORTS]
+            self.notifier.send(self._build_message(reports))
+            logger.info("재무 건전성 종목 발굴 작업 완료. 최종 후보: %d개", len(reports))
+        except Exception as exc:
+            logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
+            self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
+
+    @staticmethod
+    def _rank_reports(reports: List[DiscoveryReport]) -> List[DiscoveryReport]:
+        return sorted(
+            reports,
+            key=lambda report: (
+                report.financials.pbr,
+                report.financials.debt_to_equity,
+                -report.technicals.rsi,
+            ),
         )
 
-    lines = [
-        "📊 <b>국내 주요 종목 매수 추천 리포트</b>",
-        f"🗓 {today}",
-        "",
-        "✅ <b>매수 추천 후보</b>",
-    ]
+    @staticmethod
+    def _build_reason(metrics: FinancialMetrics, technicals: TechnicalSnapshot) -> str:
+        margin_text = "영업이익률 확인 가능"
+        if metrics.operating_margin is not None:
+            margin_text = f"영업이익률 {metrics.operating_margin:.1f}%"
+        return (
+            f"부채비율 {metrics.debt_to_equity:.1f}%와 유동비율 {metrics.current_ratio:.1f}%로 재무 안정성이 높고, "
+            f"PBR {metrics.pbr:.2f}로 자산가치 대비 저평가 구간입니다. "
+            f"{margin_text}, {technicals.trend_summary}입니다."
+        )
 
-    for item in recommendations:
-        fundamental = item["fundamental"]
+    @staticmethod
+    def _build_message(reports: List[DiscoveryReport]) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        if not reports:
+            return (
+                f"📊 재무 건전성 알짜 기업 스캐너\n"
+                f"🗓 {today}\n\n"
+                "오늘은 재무 필터와 기술적 추세 조건을 모두 만족한 종목이 없습니다."
+            )
+
+        lines = [
+            "📊 재무 건전성 알짜 기업 스캐너",
+            f"🗓 {today}",
+            f"✅ 최종 발굴 종목 {len(reports)}개",
+        ]
+
+        for report in reports:
+            financials = report.financials
+            technicals = report.technicals
+            lines.extend(
+                [
+                    "",
+                    f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
+                    f"💰 시가총액: {format_market_cap(financials.market_cap)}",
+                    (
+                        "📊 재무 핵심 지표: "
+                        f"부채비율 {financials.debt_to_equity:.1f}%, "
+                        f"유동비율 {financials.current_ratio:.1f}%, "
+                        f"PBR {financials.pbr:.2f}, "
+                        f"영업이익률 {format_optional_percent(financials.operating_margin)}"
+                    ),
+                    (
+                        "📈 기술적 상황: "
+                        f"{technicals.trend_summary} "
+                        f"(현재가 {technicals.current_price:,.0f}원, "
+                        f"RSI {technicals.rsi:.1f}, "
+                        f"20일선 {technicals.ma20:,.0f}원)"
+                    ),
+                    f"💡 추천 이유: {report.reason}",
+                ]
+            )
+
         lines.extend(
             [
                 "",
-                f"🚀 <b>{escape(str(item['name']))} ({item['ticker']})</b>",
-                f"💰 현재가: {item['current_price']:,.0f} KRW",
-                f"📦 거래량: {item['volume']:,}주",
-                f"📉 RSI: {item['rsi']:.1f}",
-                f"📈 20일 MA: {item['ma20']:,.0f} KRW",
-                f"📊 MACD: {item['macd']:.2f} / Signal {item['macd_signal']:.2f}",
-                (
-                    "🏢 기본지표: "
-                    f"PER {format_metric(fundamental.get('per'), digits=2)}, "
-                    f"PBR {format_metric(fundamental.get('pbr'), digits=2)}, "
-                    f"ROE {format_metric(fundamental.get('roe'), '%', digits=2)}"
-                ),
-                f"🧠 추천 이유: {escape(str(item['reason']))}",
+                "※ 본 메시지는 자동화된 재무/기술 필터링 결과이며 투자 수익을 보장하지 않습니다.",
             ]
         )
-
-    lines.extend(
-        [
-            "",
-            "※ 이 메시지는 기술적 지표 기반 자동 분석이며 투자 수익을 보장하지 않습니다.",
-        ]
-    )
-    return "\n".join(lines)
+        return "\n".join(lines)
 
 
-def run_analysis() -> None:
-    logging.info("주식 분석 작업 시작")
-    recommendations: List[Dict[str, object]] = []
+def format_market_cap(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value / 100_000_000:,.0f}억 원"
 
-    try:
-        for ticker, name in STOCKS.items():
-            logging.info("%s(%s) 데이터 수집 및 분석 중", name, ticker)
-            data = fetch_stock_data(ticker)
-            if data is None:
-                continue
 
-            recommendation = analyze_stock(ticker, name, data)
-            if recommendation:
-                recommendations.append(recommendation)
+def format_optional_percent(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.1f}%"
 
-        message = build_recommendation_message(recommendations)
-        send_telegram_message(message)
-        logging.info("주식 분석 작업 완료. 추천 종목 수: %d", len(recommendations))
-    except Exception as exc:
-        logging.exception("전체 분석 작업 실패: %s", exc)
-        send_telegram_message(f"⚠️ <b>주식 추천 봇 오류</b>\n{exc}")
+
+def run_scheduled_job(bot: FinancialHealthBot) -> None:
+    bot.run_once()
 
 
 def main() -> None:
-    logging.info("주식 추천 텔레그램 봇 시작")
-    logging.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
+    bot = FinancialHealthBot()
+    logger.info("재무 건전성 중심 종목 발굴 봇 시작")
+    logger.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
 
-    schedule.every().day.at(RUN_TIME_KST).do(run_analysis)
-
-    # Start once immediately so you can verify Telegram and data collection quickly.
-    run_analysis()
+    schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
+    run_scheduled_job(bot)
 
     while True:
         try:
             schedule.run_pending()
             time.sleep(30)
         except KeyboardInterrupt:
-            logging.info("사용자 요청으로 봇을 종료합니다.")
+            logger.info("사용자 요청으로 봇을 종료합니다.")
             break
         except Exception as exc:
-            logging.exception("스케줄 루프 오류: %s", exc)
-            send_telegram_message(f"⚠️ <b>스케줄 루프 오류</b>\n{exc}")
+            logger.exception("스케줄 루프 오류: %s", exc)
             time.sleep(60)
 
 

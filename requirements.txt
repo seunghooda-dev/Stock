@@ -1,5 +1,7 @@
+finance-datareader
 pandas
-pykrx
+python-dotenv
 ta
 requests
 schedule
+yfinance
