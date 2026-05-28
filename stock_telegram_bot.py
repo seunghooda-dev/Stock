@@ -30,6 +30,8 @@ MAX_REPORTS = 20
 REQUEST_DELAY_SECONDS = 0.15
 FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
+IMMEDIATE_ALERTS_ENABLED = True
+IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
 
 # Liquidity guardrails
 MIN_MARKET_CAP = 50_000_000_000
@@ -70,6 +72,7 @@ MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
 CACHE_DIR = Path("cache")
 FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
+ALERT_CACHE_FILE = CACHE_DIR / "alerts.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -658,25 +661,30 @@ class Notifier:
         self.token = token
         self.chat_id = chat_id
 
-    def send(self, message: str) -> None:
+    def send(self, message: str) -> bool:
         if not self.token or not self.chat_id:
             logger.warning("TELEGRAM_TOKEN 또는 CHAT_ID가 비어 있어 텔레그램 전송을 건너뜁니다.")
             logger.info("전송 예정 메시지:\n%s", message)
-            return
+            return False
 
-        for chunk in self._split_message(message):
-            response = requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                data={
-                    "chat_id": self.chat_id,
-                    "text": chunk,
-                    "disable_web_page_preview": True,
-                },
-                timeout=20,
-            )
-            response.raise_for_status()
+        try:
+            for chunk in self._split_message(message):
+                response = requests.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    data={
+                        "chat_id": self.chat_id,
+                        "text": chunk,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+        except requests.RequestException as exc:
+            logger.exception("텔레그램 메시지 전송 실패: %s", exc)
+            return False
 
         logger.info("텔레그램 메시지 전송 완료")
+        return True
 
     def _split_message(self, message: str) -> List[str]:
         if len(message) <= self.MAX_MESSAGE_LENGTH:
@@ -707,6 +715,7 @@ class FinancialHealthBot:
         self.technical_analyzer = TechnicalAnalyzer()
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
+        self.alert_cache: Dict[str, str] = self._load_alert_cache()
 
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
@@ -744,13 +753,74 @@ class FinancialHealthBot:
                         reason=self._build_reason(metrics, technicals),
                     )
                 )
+                latest_report = reports[-1]
+                if IMMEDIATE_ALERTS_ENABLED:
+                    self._send_immediate_alert_if_needed(latest_report, market_regime)
 
             reports = self._rank_reports(reports)[:MAX_REPORTS]
             self.notifier.send(self._build_message(reports, market_regime))
+            self._save_alert_cache()
             logger.info("재무 건전성 종목 발굴 작업 완료. 최종 후보: %d개", len(reports))
         except Exception as exc:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
             self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
+
+    def _send_immediate_alert_if_needed(self, report: DiscoveryReport, market_regime: MarketRegime) -> None:
+        cache_key = report.stock.code
+        cached_at_text = self.alert_cache.get(cache_key)
+
+        if cached_at_text:
+            try:
+                cached_at = datetime.fromisoformat(cached_at_text)
+                if datetime.now() - cached_at < timedelta(hours=IMMEDIATE_ALERT_COOLDOWN_HOURS):
+                    logger.info("%s(%s) 즉시 알림 중복 방지", report.stock.name, report.stock.code)
+                    return
+            except ValueError:
+                pass
+
+        if self.notifier.send(self._build_immediate_alert_message(report, market_regime)):
+            self.alert_cache[cache_key] = datetime.now().isoformat(timespec="seconds")
+            self._save_alert_cache()
+
+    @staticmethod
+    def _build_immediate_alert_message(report: DiscoveryReport, market_regime: MarketRegime) -> str:
+        financials = report.financials
+        technicals = report.technicals
+        return (
+            "🚨 종목 발굴 즉시 알림\n"
+            f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
+            f"💎 [{report.stock.name}({report.stock.code})]\n"
+            f"💰 시가총액: {format_market_cap(financials.market_cap)}\n"
+            f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}\n"
+            f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
+            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}\n"
+            f"📈 타점: {technicals.trend_summary} "
+            f"(현재가 {technicals.current_price:,.0f}원, RSI {technicals.rsi:.1f})\n"
+            f"🛡️ 손절선: {technicals.stop_loss:,.0f}원 "
+            f"(ATR {technicals.atr:,.0f}원 기준)\n"
+            f"🏦 수급: {format_accumulation(report.accumulation)}\n"
+            f"💡 이유: {report.reason}"
+        )
+
+    @staticmethod
+    def _load_alert_cache() -> Dict[str, str]:
+        if not ALERT_CACHE_FILE.exists():
+            return {}
+        try:
+            with ALERT_CACHE_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return {str(code): str(timestamp) for code, timestamp in data.items()}
+        except Exception as exc:
+            logger.warning("알림 캐시 로드 실패: %s", exc)
+            return {}
+
+    def _save_alert_cache(self) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with ALERT_CACHE_FILE.open("w", encoding="utf-8") as file:
+                json.dump(self.alert_cache, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("알림 캐시 저장 실패: %s", exc)
 
     @staticmethod
     def _rank_reports(reports: List[DiscoveryReport]) -> List[DiscoveryReport]:
