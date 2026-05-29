@@ -109,6 +109,28 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 - 중복 알림 기록은 `cache/alerts.json`에 저장됩니다.
 - 스캔 종료 후에는 최종 요약 리포트도 한 번 더 전송됩니다.
 
+## 장중 실시간 알림
+
+장중에는 전종목을 반복 분석하지 않고, 아침에 만든 후보군만 KIS 현재가 API로 감시합니다. 기본 흐름은 `08:40 후보군 준비 -> 09:20~14:50 실시간 감시 -> 16:00 장마감 리포트`입니다.
+
+```text
+REALTIME_SCAN_ENABLED=true
+REALTIME_CANDIDATE_RUN_TIME_KST=08:40
+REALTIME_SCAN_START_KST=09:20
+REALTIME_SCAN_END_KST=14:50
+REALTIME_SCAN_INTERVAL_SECONDS=180
+REALTIME_MAX_WATCHLIST=50
+```
+
+국내장 특화 방어 로직도 함께 적용합니다.
+
+- KOSPI 종목은 KOSPI 200일선, KOSDAQ 종목은 KOSDAQ150 추종 지표 200일선으로 Risk-On을 분리합니다.
+- 관리종목, 투자주의환기종목, SPAC은 후보군에서 제외합니다.
+- 당일 상승률 15% 이상 종목은 신규 진입 알림을 차단합니다.
+- VI 의심 등락률 또는 KIS 현재가 응답의 VI 상태 코드가 있으면 알림을 차단합니다.
+- 증거금률 100%로 확인되는 종목은 실시간 알림에서 제외합니다.
+- 장중 거래량이 시간 경과 대비 20일 평균 거래량보다 충분히 빠르지 않으면 알림을 보내지 않습니다.
+
 ## 재무 필터
 
 아래 조건을 모두 만족해야 1차 후보가 됩니다.
@@ -122,7 +144,7 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 
 ## 시장 국면 필터
 
-코스피 지수가 200일 이동평균선 아래에 있으면 Risk-Off로 판단하고 신규 매수 후보 스캔을 중단합니다.
+코스피 종목은 KOSPI, 코스닥 종목은 KOSDAQ150 추종 지표가 200일 이동평균선 아래에 있으면 Risk-Off로 판단하고 신규 매수 후보 스캔을 중단합니다.
 
 ## 기술적 필터
 
@@ -157,7 +179,8 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 - `FinancialScanner`: 전종목 유니버스 구성, yfinance 재무제표 수집, 재무 필터링
 - `KISDataProvider`: 한국투자증권 접근토큰 발급/캐시, 국내주식 기간별시세와 현재가 조회
 - `TradingEngine`: 종목 발굴 결과를 주문 계획으로 변환하고 KIS 현금 주문을 실행
-- `MarketRegimeFilter`: 코스피 200일 이동평균선 기반 Risk-On/Risk-Off 판단
+- `RealtimeScanner`: 아침 후보군을 장중 KIS 현재가로 감시하고 조건 포착 시 즉시 알림
+- `MarketRegimeFilter`: KOSPI/KOSDAQ150 200일 이동평균선 기반 Risk-On/Risk-Off 판단
 - `TechnicalAnalyzer`: RSI, 20일/60일 이동평균선, 저변동성 기반 기술적 분석
 - `AccumulationAnalyzer`: 네이버 금융 외국인/기관 순매매 기반 수급 매집 분석
 - `Notifier`: 텔레그램 리포트 전송

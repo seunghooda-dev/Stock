@@ -43,6 +43,21 @@ FAILURE_CACHE_DAYS = 3
 IMMEDIATE_ALERTS_ENABLED = True
 IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
 
+# Intraday realtime scanner settings.
+REALTIME_SCAN_ENABLED = True
+REALTIME_CANDIDATE_RUN_TIME_KST = "08:40"
+REALTIME_SCAN_START_KST = "09:20"
+REALTIME_SCAN_END_KST = "14:50"
+REALTIME_SCAN_INTERVAL_SECONDS = 180
+REALTIME_MAX_WATCHLIST = 50
+REALTIME_ALERT_COOLDOWN_HOURS = 3
+REALTIME_MIN_VOLUME_PACE = 1.20
+REALTIME_MIN_INTRADAY_CHANGE_PCT = -1.0
+REALTIME_MAX_INTRADAY_RISE_PCT = 15.0
+REALTIME_VI_GUARD_ENABLED = True
+REALTIME_VI_SUSPECT_CHANGE_PCT = 10.0
+REALTIME_BLOCK_MARGIN_RATE = 100.0
+
 # Auto-trading settings. Real orders are blocked unless explicitly enabled in .env.
 AUTO_TRADE_ENABLED = False
 AUTO_TRADE_DRY_RUN = True
@@ -64,6 +79,7 @@ MIN_DAILY_TRADING_VALUE = 500_000_000
 
 # Market regime filter
 MARKET_INDEX_CODE = "KS11"
+KOSDAQ_MARKET_INDEX_CODE = "229200"
 MARKET_REGIME_LOOKBACK_DAYS = 320
 MARKET_REGIME_MA = 200
 MAX_RELATIVE_VOLATILITY = 1.10
@@ -95,12 +111,15 @@ MAX_DISTANCE_ABOVE_MA20 = 0.08
 
 MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
+EXCLUDE_DEPT_KEYWORDS = ["관리종목", "투자주의환기", "SPAC"]
 CACHE_DIR = Path("cache")
 FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
 ALERT_CACHE_FILE = CACHE_DIR / "alerts.json"
 KIS_TOKEN_CACHE_FILE = CACHE_DIR / "kis_token.json"
 PENDING_TRADE_FILE = CACHE_DIR / "pending_trades.json"
 TRADE_HISTORY_FILE = CACHE_DIR / "trade_history.json"
+REALTIME_CANDIDATE_FILE = CACHE_DIR / "realtime_candidates.json"
+REALTIME_ALERT_FILE = CACHE_DIR / "realtime_alerts.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +137,7 @@ class StockMeta:
     market_cap: Optional[float]
     shares: Optional[float]
     trading_value: Optional[float]
+    dept: str = ""
 
 
 @dataclass
@@ -144,6 +164,9 @@ class TechnicalSnapshot:
     volatility: float
     market_volatility: float
     trend_summary: str
+    previous_close: float = 0.0
+    volume: float = 0.0
+    avg_volume20: float = 0.0
 
 
 @dataclass
@@ -202,6 +225,27 @@ class OrderResult:
     order_number: Optional[str] = None
 
 
+@dataclass
+class RealtimeCandidate:
+    stock: StockMeta
+    financials: FinancialMetrics
+    technicals: TechnicalSnapshot
+    accumulation: Optional[AccumulationSnapshot]
+    reason: str
+    created_at: str
+
+
+@dataclass
+class RealtimeSignal:
+    candidate: RealtimeCandidate
+    current_price: float
+    change_rate: float
+    volume_ratio: float
+    volume_pace_ratio: float
+    market_regime: MarketRegime
+    summary: str
+
+
 class FinancialScanner:
     def __init__(self) -> None:
         self.cache: Dict[str, Dict[str, object]] = self._load_cache()
@@ -217,11 +261,12 @@ class FinancialScanner:
             code = str(row.Code).zfill(6)
             name = str(row.Name).strip()
             market = str(row.Market).strip()
+            dept = str(getattr(row, "Dept", "") or "").strip()
             market_cap = self._safe_float(getattr(row, "Marcap", None))
             shares = self._safe_float(getattr(row, "Stocks", None))
             trading_value = self._safe_float(getattr(row, "Amount", None))
 
-            if not self._is_common_stock(name):
+            if not self._is_common_stock(name, dept):
                 continue
             if not self._passes_liquidity_filter(market_cap, trading_value):
                 continue
@@ -234,6 +279,7 @@ class FinancialScanner:
                     market_cap=market_cap,
                     shares=shares,
                     trading_value=trading_value,
+                    dept=dept,
                 )
             )
 
@@ -428,8 +474,10 @@ class FinancialScanner:
             return None
 
     @staticmethod
-    def _is_common_stock(name: str) -> bool:
+    def _is_common_stock(name: str, dept: str = "") -> bool:
         if any(keyword in name for keyword in EXCLUDE_NAME_KEYWORDS):
+            return False
+        if any(keyword in dept for keyword in EXCLUDE_DEPT_KEYWORDS):
             return False
         preferred_share_suffixes = ("우", "우B", "1우", "1우B", "2우", "2우B", "3우", "3우B")
         return not name.endswith(preferred_share_suffixes)
@@ -471,33 +519,43 @@ class MarketRegimeFilter:
     def end_date(self) -> str:
         return datetime.now().strftime("%Y-%m-%d")
 
-    def analyze(self) -> MarketRegime:
-        logger.info("Market Regime Filter: KOSPI 200일선 확인 시작")
-        data = fdr.DataReader(MARKET_INDEX_CODE, self.start_date, self.end_date)
+    def analyze(self, index_code: str = MARKET_INDEX_CODE, label: str = "KOSPI") -> MarketRegime:
+        logger.info("Market Regime Filter: %s 200일선 확인 시작", label)
+        data = fdr.DataReader(index_code, self.start_date, self.end_date)
         if data.empty or "Close" not in data.columns:
-            raise RuntimeError("코스피 지수 데이터를 수집하지 못했습니다.")
+            raise RuntimeError(f"{label} 지수 데이터를 수집하지 못했습니다.")
 
         close = data["Close"].dropna().astype(float)
         if len(close) < MARKET_REGIME_MA:
-            raise RuntimeError("코스피 200일 이동평균 계산에 필요한 데이터가 부족합니다.")
+            raise RuntimeError(f"{label} 200일 이동평균 계산에 필요한 데이터가 부족합니다.")
 
         current = float(close.iloc[-1])
         ma200 = float(close.rolling(MARKET_REGIME_MA).mean().iloc[-1])
         volatility = annualized_volatility(close)
         risk_on = current >= ma200
         summary = (
-            f"KOSPI {current:,.2f}, 200일선 {ma200:,.2f}, "
+            f"{label} {current:,.2f}, 200일선 {ma200:,.2f}, "
             f"시장 변동성 {volatility * 100:.1f}%"
         )
         logger.info("%s, Risk-On=%s", summary, risk_on)
         return MarketRegime(
-            index_code=MARKET_INDEX_CODE,
+            index_code=index_code,
             current=current,
             ma200=ma200,
             volatility=volatility,
             risk_on=risk_on,
             summary=summary,
         )
+
+    def analyze_by_market(self) -> Dict[str, MarketRegime]:
+        return {
+            "KOSPI": self.analyze(MARKET_INDEX_CODE, "KOSPI"),
+            "KOSDAQ": self.analyze(KOSDAQ_MARKET_INDEX_CODE, "KOSDAQ150"),
+        }
+
+    @staticmethod
+    def select_for_market(market: str, regimes: Dict[str, MarketRegime]) -> MarketRegime:
+        return regimes.get(market, regimes.get("KOSPI") or next(iter(regimes.values())))
 
 
 class KISDataProvider:
@@ -613,6 +671,15 @@ class KISDataProvider:
             "current_price": to_float(output.get("stck_prpr")),
             "volume": to_float(output.get("acml_vol")),
             "trading_value": to_float(output.get("acml_tr_pbmn")),
+            "change_rate": to_float(output.get("prdy_ctrt")),
+            "change_amount": to_float(output.get("prdy_vrss")),
+            "open": to_float(output.get("stck_oprc")),
+            "high": to_float(output.get("stck_hgpr")),
+            "low": to_float(output.get("stck_lwpr")),
+            "upper_limit": to_float(output.get("stck_mxpr")),
+            "lower_limit": to_float(output.get("stck_llam")),
+            "margin_rate": to_float(output.get("marg_rate")),
+            "vi_status": str(output.get("vi_cls_code") or output.get("vi_cls") or "").strip(),
         }
 
     def fetch_buyable_order(self, code: str, price: float, order_type: str = "01") -> Dict[str, object]:
@@ -961,12 +1028,19 @@ class TechnicalAnalyzer:
             if missing_columns:
                 raise ValueError(f"필수 가격 컬럼 누락: {', '.join(sorted(missing_columns))}")
 
-            prices = data[["High", "Low", "Close"]].dropna().copy()
+            columns = ["High", "Low", "Close"]
+            if "Volume" in data.columns:
+                columns.append("Volume")
+            prices = data[columns].dropna().copy()
             if len(prices) < MIN_HISTORY_DAYS:
                 raise ValueError(f"분석에 필요한 가격 데이터 부족: {len(prices)}일")
 
             prices["MA20"] = prices["Close"].rolling(MA_SHORT).mean()
             prices["MA60"] = prices["Close"].rolling(MA_LONG).mean()
+            if "Volume" in prices.columns:
+                prices["AVG_VOLUME20"] = prices["Volume"].rolling(MA_SHORT).mean()
+            else:
+                prices["AVG_VOLUME20"] = 0.0
             prices["RSI"] = RSIIndicator(close=prices["Close"], window=RSI_WINDOW).rsi()
             prices["ATR"] = AverageTrueRange(
                 high=prices["High"],
@@ -983,10 +1057,13 @@ class TechnicalAnalyzer:
             five_days_ago = prices.iloc[-6]
 
             current_price = float(latest["Close"])
+            previous_close = float(previous["Close"])
             ma20 = float(latest["MA20"])
             ma60 = float(latest["MA60"])
             rsi = float(latest["RSI"])
             atr = float(latest["ATR"])
+            volume = float(latest.get("Volume", 0.0))
+            avg_volume20 = float(latest.get("AVG_VOLUME20", 0.0))
             stop_loss = max(0.0, current_price - (ATR_STOP_MULTIPLIER * atr))
             volatility = annualized_volatility(prices["Close"])
             ma20_rising = ma20 > float(five_days_ago["MA20"])
@@ -1014,6 +1091,9 @@ class TechnicalAnalyzer:
                 volatility=volatility,
                 market_volatility=market_regime.volatility,
                 trend_summary=trend_summary,
+                previous_close=previous_close,
+                volume=volume,
+                avg_volume20=avg_volume20,
             )
         except Exception as exc:
             logger.warning("%s(%s) 기술적 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
@@ -1362,6 +1442,283 @@ class TradingEngine:
         return datetime.now() - traded_at < timedelta(hours=self.cooldown_hours)
 
 
+class RealtimeScanner:
+    def __init__(self, kis_provider: KISDataProvider, notifier: Notifier) -> None:
+        load_dotenv()
+        self.kis_provider = kis_provider
+        self.notifier = notifier
+        self.enabled = env_bool("REALTIME_SCAN_ENABLED", REALTIME_SCAN_ENABLED)
+        self.candidate_run_time = os.getenv("REALTIME_CANDIDATE_RUN_TIME_KST", REALTIME_CANDIDATE_RUN_TIME_KST)
+        self.scan_start = os.getenv("REALTIME_SCAN_START_KST", REALTIME_SCAN_START_KST)
+        self.scan_end = os.getenv("REALTIME_SCAN_END_KST", REALTIME_SCAN_END_KST)
+        self.scan_interval_seconds = env_int("REALTIME_SCAN_INTERVAL_SECONDS", REALTIME_SCAN_INTERVAL_SECONDS)
+        self.max_watchlist = env_int("REALTIME_MAX_WATCHLIST", REALTIME_MAX_WATCHLIST)
+        self.alert_cooldown_hours = env_float("REALTIME_ALERT_COOLDOWN_HOURS", REALTIME_ALERT_COOLDOWN_HOURS)
+        self.min_volume_pace = env_float("REALTIME_MIN_VOLUME_PACE", REALTIME_MIN_VOLUME_PACE)
+        self.min_intraday_change_pct = env_float(
+            "REALTIME_MIN_INTRADAY_CHANGE_PCT",
+            REALTIME_MIN_INTRADAY_CHANGE_PCT,
+        )
+        self.max_intraday_rise_pct = env_float("REALTIME_MAX_INTRADAY_RISE_PCT", REALTIME_MAX_INTRADAY_RISE_PCT)
+        self.vi_guard_enabled = env_bool("REALTIME_VI_GUARD_ENABLED", REALTIME_VI_GUARD_ENABLED)
+        self.vi_suspect_change_pct = env_float("REALTIME_VI_SUSPECT_CHANGE_PCT", REALTIME_VI_SUSPECT_CHANGE_PCT)
+        self.block_margin_rate = env_float("REALTIME_BLOCK_MARGIN_RATE", REALTIME_BLOCK_MARGIN_RATE)
+        self.alert_cache = self._load_alert_cache()
+        self.last_scan_at: Optional[datetime] = None
+
+    def save_candidate_pool(self, reports: List[DiscoveryReport], regimes: Dict[str, MarketRegime]) -> None:
+        if not self.enabled:
+            return
+
+        ranked = FinancialHealthBot._rank_reports(reports)[: max(0, self.max_watchlist)]
+        candidates = [
+            RealtimeCandidate(
+                stock=report.stock,
+                financials=report.financials,
+                technicals=report.technicals,
+                accumulation=report.accumulation,
+                reason=report.reason,
+                created_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            for report in ranked
+        ]
+
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            payload = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "regimes": {market: asdict(regime) for market, regime in regimes.items()},
+                "candidates": [asdict(candidate) for candidate in candidates],
+            }
+            with REALTIME_CANDIDATE_FILE.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            logger.info("실시간 감시 후보군 %d개 저장", len(candidates))
+        except Exception as exc:
+            logger.warning("실시간 감시 후보군 저장 실패: %s", exc)
+
+    def scan_once(self, regimes: Dict[str, MarketRegime], force: bool = False) -> List[RealtimeSignal]:
+        if not self.enabled:
+            logger.debug("실시간 스캐너 비활성화")
+            return []
+        now = datetime.now()
+        if not force and not is_time_between(now, self.scan_start, self.scan_end):
+            logger.debug("실시간 스캔 시간이 아닙니다: %s", now.strftime("%H:%M:%S"))
+            return []
+        if not force and self.last_scan_at:
+            elapsed = (now - self.last_scan_at).total_seconds()
+            if elapsed < self.scan_interval_seconds:
+                return []
+
+        self.last_scan_at = now
+        candidates = self.load_candidate_pool()
+        if not candidates:
+            logger.info("실시간 감시 후보군이 없습니다.")
+            return []
+
+        signals: List[RealtimeSignal] = []
+        for candidate in candidates[: max(0, self.max_watchlist)]:
+            market_regime = MarketRegimeFilter.select_for_market(candidate.stock.market, regimes)
+            if not market_regime.risk_on:
+                logger.debug("%s(%s) 시장 Risk-Off로 실시간 감시 제외", candidate.stock.name, candidate.stock.code)
+                continue
+
+            signal = self._evaluate_candidate(candidate, market_regime, now)
+            if signal and self._send_signal_if_needed(signal):
+                signals.append(signal)
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        if signals:
+            logger.info("실시간 시그널 %d건 전송", len(signals))
+        else:
+            logger.info("실시간 시그널 없음")
+        return signals
+
+    def load_candidate_pool(self) -> List[RealtimeCandidate]:
+        if not REALTIME_CANDIDATE_FILE.exists():
+            return []
+        try:
+            with REALTIME_CANDIDATE_FILE.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            candidates: List[RealtimeCandidate] = []
+            for item in payload.get("candidates", []):
+                if not isinstance(item, dict):
+                    continue
+                candidates.append(
+                    RealtimeCandidate(
+                        stock=StockMeta(**item["stock"]),
+                        financials=FinancialMetrics(**item["financials"]),
+                        technicals=TechnicalSnapshot(**item["technicals"]),
+                        accumulation=(
+                            AccumulationSnapshot(**item["accumulation"])
+                            if item.get("accumulation")
+                            else None
+                        ),
+                        reason=str(item.get("reason", "")),
+                        created_at=str(item.get("created_at", "")),
+                    )
+                )
+            return candidates
+        except Exception as exc:
+            logger.warning("실시간 감시 후보군 로드 실패: %s", exc)
+            return []
+
+    def build_candidate_message(self, reports: List[DiscoveryReport], regimes: Dict[str, MarketRegime]) -> str:
+        lines = [
+            "🧭 실시간 감시 후보군 준비 완료",
+            f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"📌 후보 수: {min(len(reports), self.max_watchlist)}개",
+            f"🛡️ KOSPI: {regimes['KOSPI'].summary} / Risk-On={regimes['KOSPI'].risk_on}",
+            f"🛡️ KOSDAQ: {regimes['KOSDAQ'].summary} / Risk-On={regimes['KOSDAQ'].risk_on}",
+            f"⏱️ 감시 시간: {self.scan_start}~{self.scan_end}, {self.scan_interval_seconds}초 간격",
+        ]
+        for report in FinancialHealthBot._rank_reports(reports)[: min(5, self.max_watchlist)]:
+            lines.append(
+                f"- {report.stock.name}({report.stock.code}) "
+                f"PBR {report.financials.pbr:.2f}, RSI {report.technicals.rsi:.1f}, "
+                f"20일선 {report.technicals.ma20:,.0f}원"
+            )
+        return "\n".join(lines)
+
+    def _evaluate_candidate(
+        self,
+        candidate: RealtimeCandidate,
+        market_regime: MarketRegime,
+        now: datetime,
+    ) -> Optional[RealtimeSignal]:
+        try:
+            quote = self.kis_provider.fetch_current_price(candidate.stock.code)
+            current_price = quote.get("current_price") or 0.0
+            if current_price <= 0:
+                return None
+
+            technicals = candidate.technicals
+            base_price = technicals.previous_close or technicals.current_price
+            change_rate = quote.get("change_rate")
+            if change_rate is None and base_price > 0:
+                change_rate = (current_price / base_price - 1) * 100
+            change_rate = float(change_rate or 0.0)
+
+            block_reason = self._blocking_reason(candidate, quote, current_price, change_rate)
+            if block_reason:
+                logger.debug("%s(%s) 실시간 차단: %s", candidate.stock.name, candidate.stock.code, block_reason)
+                return None
+
+            ma20 = technicals.ma20
+            if not (ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)):
+                return None
+            if current_price < ma20:
+                return None
+
+            avg_volume = technicals.avg_volume20 or technicals.volume
+            current_volume = quote.get("volume") or 0.0
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0.0
+            elapsed_ratio = market_elapsed_ratio(now)
+            required_ratio = elapsed_ratio * self.min_volume_pace
+            if avg_volume > 0 and volume_ratio < required_ratio:
+                return None
+
+            volume_pace_ratio = volume_ratio / elapsed_ratio if elapsed_ratio > 0 else 0.0
+            summary = (
+                f"20일선 상단 회복, 등락률 {change_rate:+.2f}%, "
+                f"거래량 페이스 {volume_pace_ratio:.1f}배"
+            )
+            return RealtimeSignal(
+                candidate=candidate,
+                current_price=current_price,
+                change_rate=change_rate,
+                volume_ratio=volume_ratio,
+                volume_pace_ratio=volume_pace_ratio,
+                market_regime=market_regime,
+                summary=summary,
+            )
+        except Exception as exc:
+            logger.warning("%s(%s) 실시간 평가 실패: %s", candidate.stock.name, candidate.stock.code, exc)
+            return None
+
+    def _blocking_reason(
+        self,
+        candidate: RealtimeCandidate,
+        quote: Dict[str, object],
+        current_price: float,
+        change_rate: float,
+    ) -> Optional[str]:
+        margin_rate = quote.get("margin_rate")
+        if margin_rate is not None and float(margin_rate) >= self.block_margin_rate:
+            return f"증거금률 {float(margin_rate):.0f}%"
+
+        if change_rate < self.min_intraday_change_pct:
+            return f"장중 등락률 {change_rate:+.2f}%"
+        if change_rate >= self.max_intraday_rise_pct:
+            return f"당일 급등 {change_rate:+.2f}%"
+
+        vi_status = str(quote.get("vi_status") or "").strip()
+        if self.vi_guard_enabled and vi_status and vi_status not in {"0", "N", "N/A", "-"}:
+            return f"VI 상태 코드 {vi_status}"
+        if self.vi_guard_enabled and abs(change_rate) >= self.vi_suspect_change_pct:
+            return f"VI 의심 등락률 {change_rate:+.2f}%"
+
+        if current_price <= candidate.technicals.stop_loss:
+            return "ATR 손절선 이탈"
+        return None
+
+    def _send_signal_if_needed(self, signal: RealtimeSignal) -> bool:
+        key = f"{datetime.now().strftime('%Y-%m-%d')}:{signal.candidate.stock.code}"
+        cached_at_text = self.alert_cache.get(key)
+        if cached_at_text:
+            try:
+                cached_at = datetime.fromisoformat(cached_at_text)
+                if datetime.now() - cached_at < timedelta(hours=self.alert_cooldown_hours):
+                    return False
+            except ValueError:
+                pass
+
+        sent = self.notifier.send(self._build_signal_message(signal))
+        if sent:
+            self.alert_cache[key] = datetime.now().isoformat(timespec="seconds")
+            self._save_alert_cache()
+        return sent
+
+    @staticmethod
+    def _build_signal_message(signal: RealtimeSignal) -> str:
+        candidate = signal.candidate
+        technicals = candidate.technicals
+        financials = candidate.financials
+        return (
+            "🚨 장중 실시간 시그널\n"
+            f"💎 [{candidate.stock.name}({candidate.stock.code})]\n"
+            f"🛡️ 시장 국면: {signal.market_regime.summary} / Risk-On\n"
+            f"💵 현재가: {signal.current_price:,.0f}원 ({signal.change_rate:+.2f}%)\n"
+            f"📈 포착 사유: {signal.summary}\n"
+            f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
+            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}\n"
+            f"📌 기준: RSI {technicals.rsi:.1f}, 20일선 {technicals.ma20:,.0f}원, "
+            f"거래량 페이스 {signal.volume_pace_ratio:.1f}배\n"
+            f"🛡️ 손절선: {technicals.stop_loss:,.0f}원\n"
+            f"🏦 수급: {format_accumulation(candidate.accumulation)}\n"
+            f"💡 {candidate.reason}"
+        )
+
+    @staticmethod
+    def _load_alert_cache() -> Dict[str, str]:
+        if not REALTIME_ALERT_FILE.exists():
+            return {}
+        try:
+            with REALTIME_ALERT_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return {str(code): str(timestamp) for code, timestamp in data.items()}
+        except Exception as exc:
+            logger.warning("실시간 알림 캐시 로드 실패: %s", exc)
+            return {}
+
+    def _save_alert_cache(self) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with REALTIME_ALERT_FILE.open("w", encoding="utf-8") as file:
+                json.dump(self.alert_cache, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("실시간 알림 캐시 저장 실패: %s", exc)
+
+
 class FinancialHealthBot:
     def __init__(self) -> None:
         load_dotenv()
@@ -1374,49 +1731,21 @@ class FinancialHealthBot:
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
+        self.realtime_scanner = RealtimeScanner(self.kis_provider, self.notifier)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
 
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
         try:
-            market_regime = self.market_regime_filter.analyze()
-            if not market_regime.risk_on:
+            reports, regimes = self._discover_reports(send_immediate_alerts=IMMEDIATE_ALERTS_ENABLED)
+            market_regime = regimes["KOSPI"]
+            if not any(regime.risk_on for regime in regimes.values()):
                 logger.info("Risk-Off 국면이므로 매수 후보 스캔을 중단합니다.")
                 self.notifier.send(self._build_risk_off_message(market_regime))
                 return
 
-            universe = self.financial_scanner.fetch_universe()
-            stock_map = {stock.code: stock for stock in universe}
-            financially_strong = self.financial_scanner.scan(universe)
-
-            reports: List[DiscoveryReport] = []
-            for metrics in financially_strong:
-                stock_meta = stock_map.get(metrics.code)
-                if stock_meta is None:
-                    continue
-
-                technicals = self.technical_analyzer.analyze(stock_meta, market_regime)
-                if technicals is None:
-                    continue
-
-                accumulation = self.accumulation_analyzer.analyze(stock_meta)
-                if ENABLE_SMART_MONEY_FILTER and accumulation is None:
-                    continue
-
-                reports.append(
-                    DiscoveryReport(
-                        stock=stock_meta,
-                        financials=metrics,
-                        technicals=technicals,
-                        accumulation=accumulation,
-                        reason=self._build_reason(metrics, technicals),
-                    )
-                )
-                latest_report = reports[-1]
-                if IMMEDIATE_ALERTS_ENABLED:
-                    self._send_immediate_alert_if_needed(latest_report, market_regime)
-
             reports = self._rank_reports(reports)[:MAX_REPORTS]
+            self.realtime_scanner.save_candidate_pool(reports, regimes)
             order_plans = self.trading_engine.prepare_buy_plans(reports, market_regime)
             self.trading_engine.save_pending_plans(order_plans)
             self.notifier.send(
@@ -1433,6 +1762,26 @@ class FinancialHealthBot:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
             self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
 
+    def prepare_realtime_candidates(self) -> None:
+        logger.info("실시간 감시 후보군 준비 시작")
+        try:
+            reports, regimes = self._discover_reports(send_immediate_alerts=False)
+            reports = self._rank_reports(reports)[: self.realtime_scanner.max_watchlist]
+            self.realtime_scanner.save_candidate_pool(reports, regimes)
+            self.notifier.send(self.realtime_scanner.build_candidate_message(reports, regimes))
+            logger.info("실시간 감시 후보군 준비 완료: %d개", len(reports))
+        except Exception as exc:
+            logger.exception("실시간 감시 후보군 준비 실패: %s", exc)
+            self.notifier.send(f"⚠️ 실시간 후보군 준비 오류\n{exc}")
+
+    def run_realtime_once(self, force: bool = False) -> None:
+        try:
+            regimes = self.market_regime_filter.analyze_by_market()
+            self.realtime_scanner.scan_once(regimes, force=force)
+        except Exception as exc:
+            logger.exception("실시간 스캔 실패: %s", exc)
+            self.notifier.send(f"⚠️ 실시간 스캔 오류\n{exc}")
+
     def run_trading_once(self) -> None:
         logger.info("자동매매 대기 주문 실행 시작")
         try:
@@ -1446,6 +1795,46 @@ class FinancialHealthBot:
         except Exception as exc:
             logger.exception("자동매매 대기 주문 실행 실패: %s", exc)
             self.notifier.send(f"⚠️ 자동매매 실행 오류\n{exc}")
+
+    def _discover_reports(self, send_immediate_alerts: bool) -> tuple[List[DiscoveryReport], Dict[str, MarketRegime]]:
+        regimes = self.market_regime_filter.analyze_by_market()
+        if not any(regime.risk_on for regime in regimes.values()):
+            return [], regimes
+
+        universe = self.financial_scanner.fetch_universe()
+        stock_map = {stock.code: stock for stock in universe}
+        financially_strong = self.financial_scanner.scan(universe)
+
+        reports: List[DiscoveryReport] = []
+        for metrics in financially_strong:
+            stock_meta = stock_map.get(metrics.code)
+            if stock_meta is None:
+                continue
+
+            market_regime = self.market_regime_filter.select_for_market(stock_meta.market, regimes)
+            if not market_regime.risk_on:
+                continue
+
+            technicals = self.technical_analyzer.analyze(stock_meta, market_regime)
+            if technicals is None:
+                continue
+
+            accumulation = self.accumulation_analyzer.analyze(stock_meta)
+            if ENABLE_SMART_MONEY_FILTER and accumulation is None:
+                continue
+
+            report = DiscoveryReport(
+                stock=stock_meta,
+                financials=metrics,
+                technicals=technicals,
+                accumulation=accumulation,
+                reason=self._build_reason(metrics, technicals),
+            )
+            reports.append(report)
+            if send_immediate_alerts:
+                self._send_immediate_alert_if_needed(report, market_regime)
+
+        return reports, regimes
 
     def _send_immediate_alert_if_needed(self, report: DiscoveryReport, market_regime: MarketRegime) -> None:
         cache_key = report.stock.code
@@ -1682,6 +2071,31 @@ def env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def parse_hhmm(value: str) -> tuple[int, int]:
+    hour_text, minute_text = value.strip().split(":", 1)
+    return int(hour_text), int(minute_text)
+
+
+def is_time_between(now: datetime, start_hhmm: str, end_hhmm: str) -> bool:
+    start_hour, start_minute = parse_hhmm(start_hhmm)
+    end_hour, end_minute = parse_hhmm(end_hhmm)
+    start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    return start <= now <= end
+
+
+def market_elapsed_ratio(now: datetime) -> float:
+    start_hour, start_minute = parse_hhmm("09:00")
+    end_hour, end_minute = parse_hhmm("15:30")
+    start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
+    end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
+    if now <= start:
+        return 0.01
+    if now >= end:
+        return 1.0
+    return max(0.01, min(1.0, (now - start).total_seconds() / (end - start).total_seconds()))
+
+
 def normalize_trading_env(value: str) -> str:
     normalized = (value or "").strip().lower()
     if normalized in {"real", "prod", "production", "live"}:
@@ -1745,6 +2159,14 @@ def run_scheduled_job(bot: FinancialHealthBot) -> None:
     bot.run_once()
 
 
+def run_candidate_job(bot: FinancialHealthBot) -> None:
+    bot.prepare_realtime_candidates()
+
+
+def run_realtime_job(bot: FinancialHealthBot) -> None:
+    bot.run_realtime_once()
+
+
 def run_trading_job(bot: FinancialHealthBot) -> None:
     bot.run_trading_once()
 
@@ -1753,9 +2175,18 @@ def main() -> None:
     bot = FinancialHealthBot()
     logger.info("재무 건전성 중심 종목 발굴 봇 시작")
     logger.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
+    logger.info(
+        "실시간 감시는 %s 후보 준비 후 %s~%s, %d초 간격으로 실행합니다.",
+        bot.realtime_scanner.candidate_run_time,
+        bot.realtime_scanner.scan_start,
+        bot.realtime_scanner.scan_end,
+        bot.realtime_scanner.scan_interval_seconds,
+    )
     logger.info("자동매매 대기 주문은 매일 한국 시간 기준 %s에 실행합니다.", bot.trading_engine.run_time)
 
     schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
+    schedule.every().day.at(bot.realtime_scanner.candidate_run_time).do(run_candidate_job, bot)
+    schedule.every(bot.realtime_scanner.scan_interval_seconds).seconds.do(run_realtime_job, bot)
     schedule.every().day.at(bot.trading_engine.run_time).do(run_trading_job, bot)
     run_scheduled_job(bot)
 
