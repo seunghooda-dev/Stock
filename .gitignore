@@ -4,5 +4,14 @@ __pycache__/
 venv/
 env/
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.secret
+kis_devlp.yaml
+KIS/
 cache/
+logs/
+*.log
 .DS_Store

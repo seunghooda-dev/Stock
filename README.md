@@ -57,6 +57,12 @@ KIS_ACCOUNT_PRODUCT_CODE=01
 .\.venv\Scripts\python.exe test_kis_connection.py
 ```
 
+## 민감정보 관리
+
+실제 토큰, 앱키, 앱시크릿, 계좌번호는 `.env`에만 저장하세요. `.env`, `.env.*`, `cache/`, `logs/`, KIS 설정 파일은 Git에 올라가지 않도록 차단되어 있습니다.
+
+`.env.example`에는 예시값만 남기고 실제 값은 절대 넣지 않습니다. 키가 채팅이나 로그에 노출되었다면 KIS Developers 또는 Telegram BotFather에서 재발급하는 것을 권장합니다.
+
 ## 자동매매 설계
 
 스캐너는 오후 4시에 종목을 발굴한 뒤, 매수 주문 계획을 `cache/pending_trades.json`에 저장할 수 있습니다. 실제 주문 실행은 다음 거래일 오전 9시 5분 스케줄에서 처리합니다. 기본값은 안전을 위해 자동매매 비활성화와 모의 실행입니다.
