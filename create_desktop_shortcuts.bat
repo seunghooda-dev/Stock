@@ -6,6 +6,7 @@ set "APP_DIR=%~dp0"
 set "DESKTOP=%USERPROFILE%\Desktop"
 set "RUN_FILE=%DESKTOP%\StockBot_Run.bat"
 set "STOP_FILE=%DESKTOP%\StockBot_Stop.bat"
+set "CHECK_FILE=%DESKTOP%\StockBot_Check.bat"
 
 (
     echo @echo off
@@ -19,6 +20,13 @@ set "STOP_FILE=%DESKTOP%\StockBot_Stop.bat"
     echo call "stop_stock_bot.bat"
 ) > "%STOP_FILE%"
 
+(
+    echo @echo off
+    echo cd /d "%APP_DIR%"
+    echo call "run_readiness_check.bat"
+) > "%CHECK_FILE%"
+
 echo Desktop launchers created:
 echo "%RUN_FILE%"
 echo "%STOP_FILE%"
+echo "%CHECK_FILE%"

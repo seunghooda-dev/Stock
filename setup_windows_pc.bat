@@ -50,5 +50,8 @@ call "create_desktop_shortcuts.bat"
 
 echo.
 echo Setup complete.
-echo Next step: edit .env, then run "StockBot_Run.bat" from Desktop.
+echo Next step:
+echo 1. Edit .env with Telegram/KIS settings.
+echo 2. Run "StockBot_Check.bat" from Desktop.
+echo 3. If readiness passes, run "StockBot_Run.bat" from Desktop.
 pause

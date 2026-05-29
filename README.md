@@ -2,6 +2,23 @@
 
 KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평가된 종목을 1차로 추린 뒤, 시장 국면, 저변동성, 외국인/기관 수급, 기술적 진입 타점을 함께 통과한 후보만 텔레그램으로 전송하는 스캐너 봇입니다.
 
+## 5분 운영 순서
+
+처음 보는 PC에서도 아래 순서만 지키면 현재 상태를 객관적으로 판단할 수 있습니다.
+
+1. `setup_windows_pc.bat` 실행
+2. `.env`에 텔레그램/KIS 값을 입력
+3. 바탕화면의 `StockBot_Check.bat` 실행
+4. 점검 결과가 `ALERT_READY` 또는 `DEMO_TRADE_READY`이면 `StockBot_Run.bat` 실행
+5. 실계좌 자동매매는 `operator_readiness.py --target live-trading`이 통과하고, 모의운영 로그를 충분히 확인한 뒤에만 전환
+
+운영 판단 기준은 단순합니다.
+
+- `ALERT_READY`: 종목 발굴/텔레그램 알림용으로 사용 가능
+- `DEMO_TRADE_READY`: 모의 주문 또는 dry-run 자동매매 연습 가능
+- `LIVE_TRADE_READY`: 실계좌 자동매매 설정까지 통과했지만, 실제 운용 전 사람이 최종 승인해야 함
+- `ACTION_REQUIRED`: 차단 항목이 있으므로 실행 전 수정 필요
+
 ## 데이터 소스
 
 - `FinanceDataReader`: KRX 종목 목록, 시가총액, 국내 주가 데이터
@@ -71,6 +88,38 @@ KIS_BASE_URL=https://openapivts.koreainvestment.com:29443
 
 ```powershell
 .\.venv\Scripts\python.exe test_kis_connection.py
+```
+
+## 운영 준비도 점검
+
+`operator_readiness.py`는 빌드/설정/데이터/API/위험한도를 한 번에 확인하는 운영 체크리스트입니다. 민감정보는 출력하지 않고 계좌번호는 마스킹합니다.
+
+```powershell
+.\.venv\Scripts\python.exe operator_readiness.py --target alert
+.\.venv\Scripts\python.exe operator_readiness.py --target demo-trading
+.\.venv\Scripts\python.exe operator_readiness.py --target live-trading
+```
+
+주요 점검 항목:
+
+- Python과 필수 패키지 설치 여부
+- `.env`, `.gitignore`, 실행 스크립트 존재 여부
+- Telegram Bot API 연결과 선택적 테스트 메시지 전송
+- KIS 계좌/모의투자/실전투자 설정과 현재가 조회
+- KRX/FDR 가격 데이터 품질
+- 전략 프로파일, 의사결정 등급, 자동매매 하위 점수 기준
+- 최근 백테스트 표본 수와 결과 파일 존재 여부
+
+텔레그램 테스트 메시지를 같이 보내려면 아래처럼 실행합니다.
+
+```powershell
+.\.venv\Scripts\python.exe operator_readiness.py --target alert --send-telegram-test
+```
+
+JSON으로 저장해 운영 기록을 남길 수도 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe operator_readiness.py --target alert --json > cache\readiness_report.json
 ```
 
 ## 민감정보 관리
@@ -155,6 +204,8 @@ KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 
 
 바탕화면에서 실행하려면 `StockBot_Run.bat`을 더블클릭하세요. 종료가 필요하면 `StockBot_Stop.bat`을 더블클릭하면 실행 중인 봇 프로세스를 정리합니다.
 
+실행 전에는 `StockBot_Check.bat`으로 운영 준비도를 먼저 확인하세요. 이 점검은 차단 항목이 있으면 종료 코드 1로 끝나므로, 자동 배포나 원격 PC 점검에도 사용할 수 있습니다.
+
 다른 PC를 상시 운영용으로 쓸 때는 아래 순서로 진행하세요.
 
 ```powershell
@@ -162,6 +213,7 @@ git clone https://github.com/seunghooda-dev/Stock.git
 cd Stock
 .\setup_windows_pc.bat
 notepad .env
+.\.venv\Scripts\python.exe operator_readiness.py --target alert
 .\.venv\Scripts\python.exe test_kis_connection.py
 ```
 
@@ -295,8 +347,10 @@ REALTIME_MAX_WATCHLIST=50
 - `TechnicalAnalyzer`: RSI, 20일/60일 이동평균선, 저변동성 기반 기술적 분석
 - `FactorScorer`: 재무/수급/기술/리스크를 100점 만점으로 점수화
 - `AccumulationAnalyzer`: 네이버 금융 외국인/기관 순매매 기반 수급 매집 분석
+- `DecisionPolicy`: 관심 후보/강력 후보/자동매매 가능 등급과 보류 사유 판정
 - `Notifier`: 텔레그램 리포트 전송
 - `FinancialHealthBot`: 전체 실행 흐름과 스케줄 관리
+- `operator_readiness.py`: 운영 PC, API, 데이터, 전략/위험 설정을 한 번에 점검하는 실행 전 감사 도구
 
 ## 참고
 
