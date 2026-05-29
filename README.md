@@ -15,6 +15,14 @@ KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+새 Windows PC에서 처음 세팅할 때는 저장소를 받은 뒤 아래 파일을 더블클릭하세요.
+
+```text
+setup_windows_pc.bat
+```
+
+이 파일은 `.venv` 생성, 의존성 설치, `.env.example` 복사, 바탕화면 실행/종료 배치파일 생성을 한 번에 처리합니다. 실제 토큰과 계좌 정보는 생성된 `.env`에 직접 입력해야 합니다.
+
 ## 텔레그램 설정
 
 `stock_telegram_bot.py` 상단의 값을 직접 입력하거나 `.env` 파일을 사용하세요.
@@ -106,7 +114,21 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 
 실행 직후 1회 스캔하고, 이후 매일 한국 시간 기준 오후 4시에 자동 실행됩니다.
 
-바탕화면에서 실행하려면 `Stock Bot 실행.bat`을 더블클릭하세요. 종료가 필요하면 `Stock Bot 종료.bat`을 더블클릭하면 실행 중인 봇 프로세스를 정리합니다.
+바탕화면에서 실행하려면 `StockBot_Run.bat`을 더블클릭하세요. 종료가 필요하면 `StockBot_Stop.bat`을 더블클릭하면 실행 중인 봇 프로세스를 정리합니다.
+
+다른 PC를 상시 운영용으로 쓸 때는 아래 순서로 진행하세요.
+
+```powershell
+git clone https://github.com/seunghooda-dev/Stock.git
+cd Stock
+.\setup_windows_pc.bat
+notepad .env
+.\.venv\Scripts\python.exe test_kis_connection.py
+```
+
+다른 PC에는 Git과 Python 3.11 이상이 먼저 설치되어 있어야 합니다. PC 로그인 시 자동 실행되게 하려면 `install_startup_task.bat`을 더블클릭하세요. 자동 실행을 제거하려면 `uninstall_startup_task.bat`을 사용합니다. 자동 실행 로그는 `logs/bot.log`에 저장되며, `logs/`는 Git에 올라가지 않습니다.
+
+상시 운영용 PC는 전원이 켜져 있고 Windows 사용자가 로그인되어 있어야 알림/감시가 계속 동작합니다. 절전 모드에 들어가면 봇도 멈추므로, 운영 PC의 전원 설정에서 절전 모드를 꺼두는 것을 권장합니다.
 
 ## 즉시 알림
 
