@@ -142,6 +142,11 @@ MAX_DRAWDOWN_60D = 25.0
 AUTO_TRADE_MIN_SCORE = 80.0
 AUTO_TRADE_MIN_DATA_QUALITY = 85.0
 AUTO_TRADE_MAX_STOP_LOSS_PCT = 8.0
+AUTO_TRADE_MIN_FINANCIAL_SCORE = 20.0
+AUTO_TRADE_MIN_ACCUMULATION_SCORE = 12.0
+AUTO_TRADE_MIN_TECHNICAL_SCORE = 17.0
+AUTO_TRADE_MIN_RISK_SCORE = 13.0
+SIGNAL_STRONG_BUY_SCORE = 78.0
 
 MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
@@ -278,6 +283,7 @@ class DiscoveryReport:
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
     data_quality_warnings: List[str] = field(default_factory=list)
+    decision: Optional["SignalDecision"] = None
 
 
 @dataclass
@@ -289,6 +295,15 @@ class FactorScore:
     total: float
     grade: str
     notes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SignalDecision:
+    tier: str
+    action: str
+    trade_eligible: bool
+    reasons: List[str] = field(default_factory=list)
+    vetoes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -330,6 +345,7 @@ class RealtimeCandidate:
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
     data_quality_warnings: List[str] = field(default_factory=list)
+    decision: Optional[SignalDecision] = None
 
 
 @dataclass
@@ -2057,6 +2073,178 @@ class FactorScorer:
         return "C"
 
 
+class DecisionPolicy:
+    def __init__(self) -> None:
+        self.min_factor_score = factor_score_minimum()
+        self.min_data_quality = data_quality_min_score()
+        self.strong_buy_score = env_float_profile(
+            "SIGNAL_STRONG_BUY_SCORE",
+            SIGNAL_STRONG_BUY_SCORE,
+            {"conservative": 84.0, "institutional": 78.0, "balanced": 74.0, "aggressive": 70.0},
+        )
+        self.trade_ready_score = env_float_profile(
+            "AUTO_TRADE_MIN_SCORE",
+            AUTO_TRADE_MIN_SCORE,
+            {"conservative": 85.0, "institutional": 82.0, "balanced": 78.0, "aggressive": 72.0},
+        )
+        self.auto_min_data_quality = env_float_profile(
+            "AUTO_TRADE_MIN_DATA_QUALITY",
+            AUTO_TRADE_MIN_DATA_QUALITY,
+            {"conservative": 90.0, "institutional": 85.0, "balanced": 82.0, "aggressive": 78.0},
+        )
+        self.max_stop_loss_pct = env_float_profile(
+            "AUTO_TRADE_MAX_STOP_LOSS_PCT",
+            AUTO_TRADE_MAX_STOP_LOSS_PCT,
+            {"conservative": 6.0, "institutional": 8.0, "balanced": 9.0, "aggressive": 12.0},
+        )
+        self.min_financial_score = env_float_profile(
+            "AUTO_TRADE_MIN_FINANCIAL_SCORE",
+            AUTO_TRADE_MIN_FINANCIAL_SCORE,
+            {"conservative": 22.0, "institutional": 20.0, "balanced": 18.0, "aggressive": 16.0},
+        )
+        self.min_accumulation_score = env_float_profile(
+            "AUTO_TRADE_MIN_ACCUMULATION_SCORE",
+            AUTO_TRADE_MIN_ACCUMULATION_SCORE,
+            {"conservative": 15.0, "institutional": 12.0, "balanced": 10.0, "aggressive": 8.0},
+        )
+        self.min_technical_score = env_float_profile(
+            "AUTO_TRADE_MIN_TECHNICAL_SCORE",
+            AUTO_TRADE_MIN_TECHNICAL_SCORE,
+            {"conservative": 18.0, "institutional": 17.0, "balanced": 15.0, "aggressive": 13.0},
+        )
+        self.min_risk_score = env_float_profile(
+            "AUTO_TRADE_MIN_RISK_SCORE",
+            AUTO_TRADE_MIN_RISK_SCORE,
+            {"conservative": 15.0, "institutional": 13.0, "balanced": 12.0, "aggressive": 10.0},
+        )
+        self.min_financial_score = env_float_profile(
+            "AUTO_TRADE_MIN_FINANCIAL_SCORE",
+            AUTO_TRADE_MIN_FINANCIAL_SCORE,
+            {"conservative": 22.0, "institutional": 20.0, "balanced": 18.0, "aggressive": 16.0},
+        )
+        self.min_accumulation_score = env_float_profile(
+            "AUTO_TRADE_MIN_ACCUMULATION_SCORE",
+            AUTO_TRADE_MIN_ACCUMULATION_SCORE,
+            {"conservative": 15.0, "institutional": 12.0, "balanced": 10.0, "aggressive": 8.0},
+        )
+        self.min_technical_score = env_float_profile(
+            "AUTO_TRADE_MIN_TECHNICAL_SCORE",
+            AUTO_TRADE_MIN_TECHNICAL_SCORE,
+            {"conservative": 18.0, "institutional": 17.0, "balanced": 15.0, "aggressive": 13.0},
+        )
+        self.min_risk_score = env_float_profile(
+            "AUTO_TRADE_MIN_RISK_SCORE",
+            AUTO_TRADE_MIN_RISK_SCORE,
+            {"conservative": 15.0, "institutional": 13.0, "balanced": 12.0, "aggressive": 10.0},
+        )
+        self.min_relative_strength = env_float_profile(
+            "MIN_RELATIVE_STRENGTH_60D",
+            MIN_RELATIVE_STRENGTH_60D,
+            {"conservative": 3.0, "institutional": 1.0, "balanced": 0.0, "aggressive": -3.0},
+        )
+        self.min_return_20d = env_float("MIN_RETURN_20D", MIN_RETURN_20D)
+        self.max_return_20d = env_float("MAX_RETURN_20D", MAX_RETURN_20D)
+        self.max_return_120d = env_float("MAX_RETURN_120D", MAX_RETURN_120D)
+        self.max_drawdown_60d = env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D)
+
+    def classify(self, report: DiscoveryReport) -> SignalDecision:
+        if report.score is None:
+            return SignalDecision(
+                tier="보류",
+                action="팩터 점수 산출 실패",
+                trade_eligible=False,
+                vetoes=["팩터 점수 없음"],
+            )
+
+        score = report.score
+        technicals = report.technicals
+        stop_loss_pct = self._stop_loss_pct(technicals)
+        vetoes: List[str] = []
+        if report.data_quality_score < self.min_data_quality:
+            vetoes.append(f"데이터 신뢰도 {report.data_quality_score:.1f} < {self.min_data_quality:.1f}")
+        if score.total < self.min_factor_score:
+            vetoes.append(f"종합점수 {score.total:.1f} < {self.min_factor_score:.1f}")
+        if technicals.relative_strength_60d < self.min_relative_strength:
+            vetoes.append(f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p 미달")
+        if technicals.return_20d < self.min_return_20d:
+            vetoes.append(f"20일 수익률 {technicals.return_20d:+.1f}% 약세")
+        if technicals.return_20d > self.max_return_20d:
+            vetoes.append(f"20일 수익률 {technicals.return_20d:+.1f}% 과열")
+        if technicals.return_120d > self.max_return_120d:
+            vetoes.append(f"120일 수익률 {technicals.return_120d:+.1f}% 과열")
+        if technicals.max_drawdown_60d > self.max_drawdown_60d:
+            vetoes.append(f"60일 최대낙폭 {technicals.max_drawdown_60d:.1f}% 초과")
+
+        reasons = [
+            f"점수 {score.total:.1f}/{score.grade}",
+            f"DQ {report.data_quality_score:.1f}",
+            f"상대강도 {technicals.relative_strength_60d:+.1f}%p",
+            f"손절폭 {stop_loss_pct:.1f}%",
+        ]
+        if report.accumulation is not None:
+            reasons.append(f"수급 {report.accumulation.net_buy_ratio * 100:.2f}%")
+
+        if vetoes:
+            return SignalDecision(
+                tier="보류",
+                action="매수 제외",
+                trade_eligible=False,
+                reasons=reasons,
+                vetoes=vetoes[:5],
+            )
+
+        trade_vetoes = self._trade_vetoes(report, stop_loss_pct)
+        if not trade_vetoes:
+            return SignalDecision(
+                tier="자동매매 가능",
+                action="모의 주문 또는 대기 주문 가능",
+                trade_eligible=True,
+                reasons=reasons,
+            )
+        if score.total >= self.strong_buy_score:
+            return SignalDecision(
+                tier="강력 후보",
+                action="알림 우선, 자동매매 보류",
+                trade_eligible=False,
+                reasons=reasons,
+                vetoes=trade_vetoes[:5],
+            )
+        return SignalDecision(
+            tier="관심 후보",
+            action="감시 지속",
+            trade_eligible=False,
+            reasons=reasons,
+            vetoes=trade_vetoes[:5],
+        )
+
+    def _trade_vetoes(self, report: DiscoveryReport, stop_loss_pct: float) -> List[str]:
+        if report.score is None:
+            return ["팩터 점수 없음"]
+        score = report.score
+        vetoes: List[str] = []
+        if score.total < self.trade_ready_score:
+            vetoes.append(f"자동매매 점수 {score.total:.1f} < {self.trade_ready_score:.1f}")
+        if report.data_quality_score < self.auto_min_data_quality:
+            vetoes.append(f"자동매매 DQ {report.data_quality_score:.1f} < {self.auto_min_data_quality:.1f}")
+        if stop_loss_pct > self.max_stop_loss_pct:
+            vetoes.append(f"손절폭 {stop_loss_pct:.1f}% > {self.max_stop_loss_pct:.1f}%")
+        if score.financial < self.min_financial_score:
+            vetoes.append(f"재무점수 {score.financial:.1f} < {self.min_financial_score:.1f}")
+        if score.accumulation < self.min_accumulation_score:
+            vetoes.append(f"수급점수 {score.accumulation:.1f} < {self.min_accumulation_score:.1f}")
+        if score.technical < self.min_technical_score:
+            vetoes.append(f"기술점수 {score.technical:.1f} < {self.min_technical_score:.1f}")
+        if score.risk < self.min_risk_score:
+            vetoes.append(f"리스크점수 {score.risk:.1f} < {self.min_risk_score:.1f}")
+        return vetoes
+
+    @staticmethod
+    def _stop_loss_pct(technicals: TechnicalSnapshot) -> float:
+        if technicals.current_price <= 0 or technicals.stop_loss <= 0:
+            return 100.0
+        return max(0.0, (technicals.current_price - technicals.stop_loss) / technicals.current_price * 100)
+
+
 class Notifier:
     MAX_MESSAGE_LENGTH = 3900
 
@@ -2213,6 +2401,15 @@ class TradingEngine:
 
     def _passes_auto_trade_gate(self, report: DiscoveryReport) -> bool:
         score = report.score.total if report.score else 0.0
+        if report.decision and not report.decision.trade_eligible:
+            logger.info(
+                "%s(%s) 의사결정 등급 %s로 자동매매 보류: %s",
+                report.stock.name,
+                report.stock.code,
+                report.decision.tier,
+                "; ".join(report.decision.vetoes[:3]) or report.decision.action,
+            )
+            return False
         if score < self.min_score:
             logger.info(
                 "%s(%s) 자동매매 점수 %.1f 미달(기준 %.1f)",
@@ -2231,6 +2428,24 @@ class TradingEngine:
                 self.min_data_quality,
             )
             return False
+        if report.score:
+            factor_checks = [
+                ("재무", report.score.financial, self.min_financial_score),
+                ("수급", report.score.accumulation, self.min_accumulation_score),
+                ("기술", report.score.technical, self.min_technical_score),
+                ("리스크", report.score.risk, self.min_risk_score),
+            ]
+            for label, value, minimum in factor_checks:
+                if value < minimum:
+                    logger.info(
+                        "%s(%s) 자동매매 %s점수 %.1f 미달(기준 %.1f)",
+                        report.stock.name,
+                        report.stock.code,
+                        label,
+                        value,
+                        minimum,
+                    )
+                    return False
         current_price = report.technicals.current_price
         stop_loss = report.technicals.stop_loss
         if current_price <= 0 or stop_loss <= 0:
@@ -2313,6 +2528,9 @@ class TradingEngine:
             f"{mode}, {self.kis_provider.trading_env}, 계좌 {account}, "
             f"주문시간 {self.run_time}, 1회 최대 {self.max_orders_per_run}건, "
             f"최소점수 {self.min_score:.1f}, 최소DQ {self.min_data_quality:.1f}, "
+            f"하위점수 재무/수급/기술/리스크 "
+            f"{self.min_financial_score:.0f}/{self.min_accumulation_score:.0f}/"
+            f"{self.min_technical_score:.0f}/{self.min_risk_score:.0f}, "
             f"종목당 위험한도 {self.risk_per_trade_krw:,.0f}원"
         )
 
@@ -2491,6 +2709,10 @@ class RealtimeScanner:
                 reason=report.reason,
                 created_at=datetime.now().isoformat(timespec="seconds"),
                 score=report.score,
+                data_quality_score=report.data_quality_score,
+                data_quality_grade=report.data_quality_grade,
+                data_quality_warnings=report.data_quality_warnings,
+                decision=report.decision,
             )
             for report in ranked
         ]
@@ -2577,6 +2799,11 @@ class RealtimeScanner:
                         data_quality_score=data_quality_score,
                         data_quality_grade=str(item.get("data_quality_grade", "N/A")),
                         data_quality_warnings=list(item.get("data_quality_warnings") or []),
+                        decision=(
+                            SignalDecision(**item["decision"])
+                            if isinstance(item.get("decision"), dict)
+                            else None
+                        ),
                     )
                 )
             return candidates
@@ -2597,6 +2824,7 @@ class RealtimeScanner:
             lines.append(
                 f"- {report.stock.name}({report.stock.code}) "
                 f"{format_factor_score(report.score)}, PBR {report.financials.pbr:.2f}, "
+                f"{report.decision.tier if report.decision else '판단 N/A'}, "
                 f"DQ {report.data_quality_score:.1f}, "
                 f"RSI {report.technicals.rsi:.1f}, "
                 f"20일선 {report.technicals.ma20:,.0f}원"
@@ -2712,6 +2940,7 @@ class RealtimeScanner:
             f"💎 [{candidate.stock.name}({candidate.stock.code})]\n"
             f"🛡️ 시장 국면: {signal.market_regime.summary} / Risk-On\n"
             f"⭐ 종합점수: {format_factor_score(candidate.score)}\n"
+            f"🧭 의사결정: {format_signal_decision(candidate.decision)}\n"
             f"🧾 데이터 신뢰도: {format_data_quality(candidate.data_quality_score, candidate.data_quality_grade, candidate.data_quality_warnings)}\n"
             f"💵 현재가: {signal.current_price:,.0f}원 ({signal.change_rate:+.2f}%)\n"
             f"📈 포착 사유: {signal.summary}\n"
@@ -2758,6 +2987,7 @@ class FinancialHealthBot:
         self.technical_analyzer = TechnicalAnalyzer(self.kis_provider)
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.factor_scorer = FactorScorer()
+        self.decision_policy = DecisionPolicy()
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
         self.realtime_scanner = RealtimeScanner(self.kis_provider, self.notifier)
@@ -2882,6 +3112,15 @@ class FinancialHealthBot:
                     report.score.total,
                 )
                 continue
+            report.decision = self.decision_policy.classify(report)
+            if report.decision.tier == "보류":
+                logger.debug(
+                    "%s(%s) 의사결정 보류: %s",
+                    report.stock.name,
+                    report.stock.code,
+                    "; ".join(report.decision.vetoes),
+                )
+                continue
             reports.append(report)
             if send_immediate_alerts:
                 self._send_immediate_alert_if_needed(report, market_regime)
@@ -2914,6 +3153,7 @@ class FinancialHealthBot:
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
             f"💎 [{report.stock.name}({report.stock.code})]\n"
             f"⭐ 종합점수: {format_factor_score(report.score)}\n"
+            f"🧭 의사결정: {format_signal_decision(report.decision)}\n"
             f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}\n"
             f"💰 시가총액: {format_market_cap(financials.market_cap)}\n"
             f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}\n"
@@ -2955,6 +3195,8 @@ class FinancialHealthBot:
         return sorted(
             reports,
             key=lambda report: (
+                decision_rank(report.decision),
+                -(1 if report.decision and report.decision.trade_eligible else 0),
                 -(report.score.total if report.score else 0.0),
                 -report.data_quality_score,
                 -((report.accumulation.net_buy_amount_to_market_cap if report.accumulation and report.accumulation.net_buy_amount_to_market_cap else 0.0)),
@@ -3007,6 +3249,7 @@ class FinancialHealthBot:
                     "",
                     f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
                     f"⭐ 종합점수: {format_factor_score(report.score)}",
+                    f"🧭 의사결정: {format_signal_decision(report.decision)}",
                     f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}",
                     f"💰 시가총액: {format_market_cap(financials.market_cap)}",
                     f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}",
@@ -3168,6 +3411,29 @@ def format_factor_score(score: Optional[FactorScore]) -> str:
         f"[재무 {score.financial:.1f}, 수급 {score.accumulation:.1f}, "
         f"기술 {score.technical:.1f}, 리스크 {score.risk:.1f}]"
     )
+
+
+def decision_rank(decision: Optional[SignalDecision]) -> int:
+    if decision is None:
+        return 9
+    order = {
+        "자동매매 가능": 0,
+        "강력 후보": 1,
+        "관심 후보": 2,
+        "보류": 8,
+    }
+    return order.get(decision.tier, 5)
+
+
+def format_signal_decision(decision: Optional[SignalDecision]) -> str:
+    if decision is None:
+        return "N/A"
+    text = f"{decision.tier} / {decision.action}"
+    if decision.reasons:
+        text += " / 근거: " + " · ".join(decision.reasons[:4])
+    if decision.vetoes:
+        text += " / 보류: " + " · ".join(decision.vetoes[:3])
+    return text
 
 
 def format_data_quality(score: float, grade: str, warnings: Optional[List[str]] = None) -> str:

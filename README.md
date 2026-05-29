@@ -98,6 +98,10 @@ AUTO_TRADE_RISK_PER_TRADE_KRW=50000
 AUTO_TRADE_MIN_SCORE=82
 AUTO_TRADE_MIN_DATA_QUALITY=85
 AUTO_TRADE_MAX_STOP_LOSS_PCT=8
+AUTO_TRADE_MIN_FINANCIAL_SCORE=20
+AUTO_TRADE_MIN_ACCUMULATION_SCORE=12
+AUTO_TRADE_MIN_TECHNICAL_SCORE=17
+AUTO_TRADE_MIN_RISK_SCORE=13
 ```
 
 실제 주문을 보내려면 아래 값을 모두 의도적으로 바꿔야 합니다.
@@ -130,6 +134,16 @@ KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 
 - `aggressive`: 더 많은 후보를 보되 실전 주문 전 방어 게이트는 유지
 
 현재 권장값은 `institutional`, `MIN_FACTOR_SCORE=72`, `MIN_DATA_QUALITY_SCORE=80`, `AUTO_TRADE_MIN_SCORE=82`, `AUTO_TRADE_MIN_DATA_QUALITY=85`입니다.
+
+## 의사결정 등급
+
+봇은 최종 후보를 바로 같은 수준의 매수 신호로 보지 않고, 근거와 보류 사유를 함께 붙여 3단계로 나눕니다.
+
+- `관심 후보`: 최종 필터는 통과했지만 자동매매 기준에는 부족하므로 장중 감시 대상으로만 유지
+- `강력 후보`: 점수와 근거가 강하지만 하위 점수, 데이터 품질, 손절폭 중 하나가 부족해 자동매매는 보류
+- `자동매매 가능`: 종합점수, 데이터 신뢰도, 손절폭, 재무/수급/기술/리스크 하위 점수를 모두 통과
+
+이 등급은 텔레그램 리포트의 `의사결정` 줄에 표시됩니다. 실계좌 자동매매는 등급이 `자동매매 가능`이어도 `.env`에서 실전 주문 확인값을 명시적으로 켜기 전까지 차단됩니다.
 
 ## 실행
 
@@ -221,6 +235,7 @@ REALTIME_MAX_WATCHLIST=50
 - 유동성이 낮은 종목은 호가 공백과 체결 리스크가 크기 때문에 사전에 제외합니다.
 - 자동매매는 1회 주문 수, 종목당 예산, 1회 총 노출 한도, 동일 종목 재진입 쿨다운을 적용합니다.
 - 알림 후보보다 자동매매 후보 기준이 더 높습니다. 기본값은 종합점수 82점 이상, 데이터 신뢰도 85점 이상, ATR 손절폭 8% 이하입니다.
+- 자동매매는 총점만 보지 않고 재무 20점, 수급 12점, 기술 17점, 리스크 13점 이상의 하위 점수 기준도 함께 확인합니다.
 - 주문 실행 직전에도 시장 국면을 재확인하고, Risk-Off면 대기 주문을 폐기합니다.
 - 실전 주문은 `AUTO_TRADE_CONFIRM_REAL_TRADING=YES`가 없으면 코드상에서 차단됩니다.
 - `AUTO_TRADE_USE_RISK_SIZING=true`일 때는 고정 매수금액만 보지 않고, `매수가 - ATR 손절가` 기준으로 종목당 예상 손실이 `AUTO_TRADE_RISK_PER_TRADE_KRW`를 넘지 않게 수량을 줄입니다.
