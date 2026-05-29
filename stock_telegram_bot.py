@@ -32,6 +32,8 @@ KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
 KIS_ACCOUNT_NO = ""
 KIS_ACCOUNT_PRODUCT_CODE = "01"
 KIS_TRADING_ENV = "real"
+KIS_MAX_RETRIES = 2
+KIS_RETRY_DELAY_SECONDS = 1.0
 
 # Scanner settings
 RUN_TIME_KST = "16:00"
@@ -44,6 +46,14 @@ FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
 KRX_FUNDAMENTAL_LOOKBACK_DAYS = 10
 ENABLE_PYKRX_FUNDAMENTALS = True
+STRICT_DATA_VALIDATION = True
+MIN_DATA_QUALITY_SCORE = 70.0
+ENABLE_PRICE_CROSSCHECK = True
+MAX_PRICE_STALENESS_DAYS = 7
+MAX_INVESTOR_DATA_STALENESS_DAYS = 10
+MAX_CROSS_SOURCE_CLOSE_DIFF_PCT = 2.5
+MAX_OHLC_ANOMALY_RATIO = 0.02
+MAX_SINGLE_DAY_MOVE_PCT = 35.0
 IMMEDIATE_ALERTS_ENABLED = True
 IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
 
@@ -154,6 +164,16 @@ class StockMeta:
 
 
 @dataclass
+class DataQualityReport:
+    source: str
+    score: float
+    grade: str
+    passed: bool
+    checks: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
 class FinancialMetrics:
     code: str
     name: str
@@ -172,6 +192,9 @@ class FinancialMetrics:
     operating_income_growth_yoy: Optional[float] = None
     financial_source: str = "yfinance"
     quality_notes: List[str] = field(default_factory=list)
+    data_quality_score: float = 0.0
+    data_quality_grade: str = "N/A"
+    data_quality_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -188,6 +211,10 @@ class TechnicalSnapshot:
     previous_close: float = 0.0
     volume: float = 0.0
     avg_volume20: float = 0.0
+    price_source: str = ""
+    data_quality_score: float = 0.0
+    data_quality_grade: str = "N/A"
+    data_quality_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -205,6 +232,9 @@ class AccumulationSnapshot:
     combined_net_buy_amount: float = 0.0
     net_buy_amount_to_market_cap: Optional[float] = None
     net_buy_amount_to_trading_value: Optional[float] = None
+    data_quality_score: float = 0.0
+    data_quality_grade: str = "N/A"
+    data_quality_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -225,6 +255,9 @@ class DiscoveryReport:
     accumulation: Optional[AccumulationSnapshot]
     reason: str
     score: Optional["FactorScore"] = None
+    data_quality_score: float = 0.0
+    data_quality_grade: str = "N/A"
+    data_quality_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -274,6 +307,9 @@ class RealtimeCandidate:
     reason: str
     created_at: str
     score: Optional[FactorScore] = None
+    data_quality_score: float = 0.0
+    data_quality_grade: str = "N/A"
+    data_quality_warnings: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -405,6 +441,205 @@ class KrxFundamentalProvider:
         if not frames:
             return None
         return pd.concat(frames)
+
+
+class DataQualityValidator:
+    @staticmethod
+    def validate_price_frame(
+        data: pd.DataFrame,
+        source: str,
+        min_rows: int = MIN_HISTORY_DAYS,
+    ) -> DataQualityReport:
+        score = 100.0
+        checks: List[str] = []
+        warnings: List[str] = []
+
+        if data is None or data.empty:
+            return DataQualityValidator._report(source, 0.0, checks, ["가격 데이터가 비어 있습니다."])
+
+        frame = data.copy()
+        required = {"High", "Low", "Close"}
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            return DataQualityValidator._report(
+                source,
+                0.0,
+                checks,
+                [f"필수 가격 컬럼 누락: {', '.join(missing)}"],
+            )
+        checks.append("필수 OHLC 컬럼 확인")
+
+        if not isinstance(frame.index, pd.DatetimeIndex):
+            frame.index = pd.to_datetime(frame.index, errors="coerce")
+        invalid_index_ratio = float(frame.index.isna().mean()) if len(frame) else 1.0
+        if invalid_index_ratio > 0:
+            score -= min(30.0, invalid_index_ratio * 100)
+            warnings.append(f"날짜 인덱스 변환 실패 {invalid_index_ratio * 100:.1f}%")
+        frame = frame[frame.index.notna()].sort_index()
+
+        duplicate_count = int(frame.index.duplicated().sum())
+        if duplicate_count:
+            score -= min(15.0, duplicate_count / max(len(frame), 1) * 100)
+            warnings.append(f"중복 날짜 {duplicate_count}건")
+        else:
+            checks.append("중복 날짜 없음")
+
+        for column in ["Open", "High", "Low", "Close", "Volume"]:
+            if column in frame.columns:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+        valid_rows = frame.dropna(subset=["High", "Low", "Close"])
+        if len(valid_rows) < min_rows:
+            score -= 45.0
+            warnings.append(f"유효 가격 데이터 부족: {len(valid_rows)}일")
+        else:
+            checks.append(f"유효 가격 데이터 {len(valid_rows)}일")
+
+        close = valid_rows["Close"].astype(float)
+        positive_close_ratio = float((close > 0).mean()) if len(close) else 0.0
+        if positive_close_ratio < 1.0:
+            penalty = (1.0 - positive_close_ratio) * 80.0
+            score -= penalty
+            warnings.append(f"0 이하 종가 비율 {(1.0 - positive_close_ratio) * 100:.1f}%")
+
+        ohlc_ok = (valid_rows["High"] >= valid_rows["Low"]) & (valid_rows["High"] >= valid_rows["Close"]) & (
+            valid_rows["Low"] <= valid_rows["Close"]
+        )
+        if "Open" in valid_rows.columns:
+            ohlc_ok = ohlc_ok & (valid_rows["High"] >= valid_rows["Open"]) & (valid_rows["Low"] <= valid_rows["Open"])
+        anomaly_ratio = float((~ohlc_ok).mean()) if len(valid_rows) else 1.0
+        if anomaly_ratio > MAX_OHLC_ANOMALY_RATIO:
+            score -= min(35.0, anomaly_ratio * 100)
+            warnings.append(f"OHLC 불일치 비율 {anomaly_ratio * 100:.1f}%")
+        else:
+            checks.append("OHLC 범위 정상")
+
+        latest_date = valid_rows.index.max() if not valid_rows.empty else None
+        if latest_date is not None:
+            stale_days = (datetime.now().date() - latest_date.date()).days
+            max_staleness_days = env_int("MAX_PRICE_STALENESS_DAYS", MAX_PRICE_STALENESS_DAYS)
+            if stale_days > max_staleness_days:
+                score -= min(40.0, (stale_days - max_staleness_days) * 6.0)
+                warnings.append(f"최신 가격 데이터 지연 {stale_days}일")
+            else:
+                checks.append(f"최신 가격 데이터 {latest_date.strftime('%Y-%m-%d')}")
+
+        if "Volume" in valid_rows.columns:
+            volume = valid_rows["Volume"].dropna().astype(float)
+            negative_volume = int((volume < 0).sum())
+            if negative_volume:
+                score -= 25.0
+                warnings.append(f"음수 거래량 {negative_volume}건")
+            zero_volume_ratio = float((volume <= 0).mean()) if len(volume) else 1.0
+            if zero_volume_ratio > 0.2:
+                score -= min(20.0, zero_volume_ratio * 40)
+                warnings.append(f"0 거래량 비율 {zero_volume_ratio * 100:.1f}%")
+        else:
+            score -= 8.0
+            warnings.append("거래량 컬럼 없음")
+
+        returns = close.pct_change().abs().dropna()
+        if not returns.empty and float(returns.max() * 100) > MAX_SINGLE_DAY_MOVE_PCT:
+            warnings.append(f"단일 일간 변동률 {float(returns.max() * 100):.1f}% 감지")
+            score -= 5.0
+
+        return DataQualityValidator._report(source, score, checks, warnings)
+
+    @staticmethod
+    def compare_price_sources(
+        primary: pd.DataFrame,
+        secondary: pd.DataFrame,
+        primary_source: str,
+        secondary_source: str,
+    ) -> DataQualityReport:
+        source = f"{primary_source}+{secondary_source}"
+        checks: List[str] = []
+        warnings: List[str] = []
+        score = 100.0
+
+        if primary is None or primary.empty or secondary is None or secondary.empty:
+            return DataQualityValidator._report(source, 55.0, checks, ["교차검증 소스 중 하나가 비어 있습니다."])
+
+        left = primary.copy()
+        right = secondary.copy()
+        if not isinstance(left.index, pd.DatetimeIndex):
+            left.index = pd.to_datetime(left.index, errors="coerce")
+        if not isinstance(right.index, pd.DatetimeIndex):
+            right.index = pd.to_datetime(right.index, errors="coerce")
+        left = left[left.index.notna()].sort_index()
+        right = right[right.index.notna()].sort_index()
+        left = left[~left.index.duplicated(keep="last")]
+        right = right[~right.index.duplicated(keep="last")]
+
+        common_dates = left.index.intersection(right.index)
+        if common_dates.empty:
+            return DataQualityValidator._report(source, 45.0, checks, ["KIS/FDR 공통 거래일이 없습니다."])
+
+        latest_left = left.index.max()
+        latest_right = right.index.max()
+        latest_gap_days = abs((latest_left.date() - latest_right.date()).days)
+        if latest_gap_days:
+            score -= min(25.0, latest_gap_days * 10.0)
+            warnings.append(
+                f"최신 거래일 불일치: {primary_source} {latest_left.strftime('%Y-%m-%d')}, "
+                f"{secondary_source} {latest_right.strftime('%Y-%m-%d')}"
+            )
+        else:
+            checks.append(f"최신 거래일 일치 {latest_left.strftime('%Y-%m-%d')}")
+
+        latest = common_dates.max()
+        left_close = to_float(left.loc[latest, "Close"])
+        right_close = to_float(right.loc[latest, "Close"])
+        if not left_close or not right_close or right_close <= 0:
+            return DataQualityValidator._report(source, 50.0, checks, ["교차검증 종가를 해석하지 못했습니다."])
+
+        diff_pct = abs(left_close / right_close - 1) * 100
+        max_close_diff_pct = env_float("MAX_CROSS_SOURCE_CLOSE_DIFF_PCT", MAX_CROSS_SOURCE_CLOSE_DIFF_PCT)
+        if diff_pct > max_close_diff_pct:
+            score -= min(65.0, diff_pct * 8.0)
+            warnings.append(f"{latest.strftime('%Y-%m-%d')} 종가 차이 {diff_pct:.2f}%")
+        else:
+            checks.append(f"{latest.strftime('%Y-%m-%d')} 종가 차이 {diff_pct:.2f}%")
+
+        overlap_ratio = len(common_dates) / max(min(len(left), len(right)), 1)
+        if overlap_ratio < 0.85:
+            score -= (0.85 - overlap_ratio) * 40
+            warnings.append(f"공통 거래일 비율 {overlap_ratio * 100:.1f}%")
+        else:
+            checks.append(f"공통 거래일 비율 {overlap_ratio * 100:.1f}%")
+
+        return DataQualityValidator._report(source, score, checks, warnings)
+
+    @staticmethod
+    def merge_reports(source: str, reports: List[DataQualityReport], weights: Optional[List[float]] = None) -> DataQualityReport:
+        valid_reports = [report for report in reports if report is not None]
+        if not valid_reports:
+            return DataQualityValidator._report(source, 0.0, [], ["데이터 품질 리포트가 없습니다."])
+        if weights is None or len(weights) != len(valid_reports):
+            weights = [1.0 / len(valid_reports)] * len(valid_reports)
+        total_weight = sum(weights) or 1.0
+        score = sum(report.score * weight for report, weight in zip(valid_reports, weights)) / total_weight
+        checks: List[str] = []
+        warnings: List[str] = []
+        for report in valid_reports:
+            checks.extend([f"{report.source}: {item}" for item in report.checks[:3]])
+            warnings.extend([f"{report.source}: {item}" for item in report.warnings[:3]])
+        return DataQualityValidator._report(source, score, checks, warnings)
+
+    @staticmethod
+    def _report(source: str, score: float, checks: List[str], warnings: List[str]) -> DataQualityReport:
+        clean_score = round(clamp(score, 0.0, 100.0), 1)
+        grade = quality_grade(clean_score)
+        min_score = env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE)
+        passed = clean_score >= min_score or not env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION)
+        return DataQualityReport(
+            source=source,
+            score=clean_score,
+            grade=grade,
+            passed=passed,
+            checks=checks[:8],
+            warnings=warnings[:8],
+        )
 
 
 class FinancialScanner:
@@ -561,6 +796,10 @@ class FinancialScanner:
                 financial_source=financial_source,
                 quality_notes=quality_notes,
             )
+            financial_quality = self._validate_financial_metrics(metrics, computed_pbr, krx_metrics)
+            metrics.data_quality_score = financial_quality.score
+            metrics.data_quality_grade = financial_quality.grade
+            metrics.data_quality_warnings = financial_quality.warnings
             self.cache[stock_meta.code] = {
                 "cached_at": datetime.now().isoformat(timespec="seconds"),
                 "metrics": asdict(metrics),
@@ -585,9 +824,72 @@ class FinancialScanner:
             return False
         if not all(value > 0 for value in metrics.operating_income_years[:REQUIRED_PROFIT_YEARS]):
             return False
+        if metrics.data_quality_score < env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE):
+            return False
         if env_bool("ENABLE_VALUE_TRAP_GUARD", ENABLE_VALUE_TRAP_GUARD) and self._looks_like_value_trap(metrics):
             return False
         return True
+
+    @staticmethod
+    def _validate_financial_metrics(
+        metrics: FinancialMetrics,
+        computed_pbr: float,
+        krx_metrics: Optional[KrxFundamental],
+    ) -> DataQualityReport:
+        score = 100.0
+        checks: List[str] = []
+        warnings: List[str] = []
+
+        if metrics.market_cap is None or metrics.market_cap <= 0:
+            score -= 60.0
+            warnings.append("시가총액 없음")
+        else:
+            checks.append("시가총액 확인")
+
+        sanity_checks = [
+            ("부채비율", metrics.debt_to_equity, 0.0, 1_000.0),
+            ("유동비율", metrics.current_ratio, 0.0, 5_000.0),
+            ("PBR", metrics.pbr, 0.0, 20.0),
+        ]
+        for label, value, minimum, maximum in sanity_checks:
+            if value is None or value <= minimum or value > maximum:
+                score -= 25.0
+                warnings.append(f"{label} 비정상값 {value}")
+            else:
+                checks.append(f"{label} 범위 확인")
+
+        if len(metrics.operating_income_years) < REQUIRED_PROFIT_YEARS:
+            score -= 40.0
+            warnings.append("영업이익 연속성 데이터 부족")
+        elif not all(value > 0 for value in metrics.operating_income_years[:REQUIRED_PROFIT_YEARS]):
+            score -= 35.0
+            warnings.append("영업이익 흑자 연속성 실패")
+        else:
+            checks.append("영업이익 3년 연속 흑자")
+
+        if krx_metrics is None:
+            score -= 8.0
+            warnings.append("pykrx 보강 데이터 없음")
+        elif krx_metrics.pbr and computed_pbr > 0:
+            pbr_diff_pct = abs(krx_metrics.pbr / computed_pbr - 1) * 100
+            if pbr_diff_pct > 35.0:
+                score -= min(25.0, pbr_diff_pct / 2)
+                warnings.append(f"pykrx/yfinance PBR 차이 {pbr_diff_pct:.1f}%")
+            else:
+                checks.append(f"pykrx/yfinance PBR 차이 {pbr_diff_pct:.1f}%")
+
+        optional_missing = []
+        if metrics.roe is None:
+            optional_missing.append("ROE")
+        if metrics.revenue_growth_yoy is None:
+            optional_missing.append("매출 YoY")
+        if metrics.operating_income_growth_yoy is None:
+            optional_missing.append("영업이익 YoY")
+        if optional_missing:
+            score -= min(15.0, len(optional_missing) * 4.0)
+            warnings.append(f"보조 지표 누락: {', '.join(optional_missing)}")
+
+        return DataQualityValidator._report(metrics.financial_source, score, checks, warnings)
 
     @staticmethod
     def _looks_like_value_trap(metrics: FinancialMetrics) -> bool:
@@ -618,6 +920,8 @@ class FinancialScanner:
                 return None
 
             metrics = item["metrics"]
+            if "data_quality_score" not in metrics:
+                return None
             return FinancialMetrics(
                 code=str(metrics["code"]),
                 name=str(metrics["name"]),
@@ -636,6 +940,9 @@ class FinancialScanner:
                 operating_income_growth_yoy=self._safe_float(metrics.get("operating_income_growth_yoy")),
                 financial_source=str(metrics.get("financial_source", "yfinance")),
                 quality_notes=list(metrics.get("quality_notes") or []),
+                data_quality_score=float(metrics.get("data_quality_score", 0.0)),
+                data_quality_grade=str(metrics.get("data_quality_grade", "N/A")),
+                data_quality_warnings=list(metrics.get("data_quality_warnings") or []),
             )
         except Exception:
             return None
@@ -1022,8 +1329,9 @@ class KISDataProvider:
 
     def _get(self, path: str, tr_id: str, params: Dict[str, str]) -> Dict[str, object]:
         token = self._get_access_token()
-        response = self.session.get(
-            f"{self.base_url}{path}",
+        response = self._request_with_retry(
+            "GET",
+            path,
             headers=self._build_headers(token=token, tr_id=tr_id),
             params=params,
             timeout=20,
@@ -1043,8 +1351,10 @@ class KISDataProvider:
         if include_hashkey:
             headers["hashkey"] = self._create_hashkey(token, body)
 
-        response = self.session.post(
-            f"{self.base_url}{path}",
+        response = self._request_with_retry(
+            "POST",
+            path,
+            allow_retry=(path != self.ORDER_CASH_PATH),
             headers=headers,
             json=body,
             timeout=20,
@@ -1053,8 +1363,9 @@ class KISDataProvider:
         return self._validate_payload(response.json())
 
     def _create_hashkey(self, token: str, body: Dict[str, str]) -> str:
-        response = self.session.post(
-            f"{self.base_url}{self.HASHKEY_PATH}",
+        response = self._request_with_retry(
+            "POST",
+            self.HASHKEY_PATH,
             headers=self._build_headers(token=token, tr_id=""),
             json=body,
             timeout=20,
@@ -1065,6 +1376,34 @@ class KISDataProvider:
         if not hashkey:
             raise RuntimeError(f"KIS hashkey 발급 실패: {payload}")
         return str(hashkey)
+
+    def _request_with_retry(
+        self,
+        method: str,
+        path: str,
+        allow_retry: bool = True,
+        **kwargs,
+    ) -> requests.Response:
+        max_retries = env_int("KIS_MAX_RETRIES", KIS_MAX_RETRIES) if allow_retry else 0
+        retry_delay = env_float("KIS_RETRY_DELAY_SECONDS", KIS_RETRY_DELAY_SECONDS)
+        retry_statuses = {429, 500, 502, 503, 504}
+
+        for attempt in range(max_retries + 1):
+            response = self.session.request(method, f"{self.base_url}{path}", **kwargs)
+            if response.status_code not in retry_statuses or attempt >= max_retries:
+                return response
+            wait_seconds = retry_delay * (attempt + 1)
+            logger.warning(
+                "KIS %s %s HTTP %s, %.1f초 후 재시도(%d/%d)",
+                method,
+                path,
+                response.status_code,
+                wait_seconds,
+                attempt + 1,
+                max_retries,
+            )
+            time.sleep(wait_seconds)
+        return response
 
     def _build_headers(self, token: str, tr_id: str) -> Dict[str, str]:
         headers = {
@@ -1170,6 +1509,12 @@ class AccumulationAnalyzer:
 
         try:
             investor_data = self._fetch_investor_data(stock_meta.code)
+            data_quality = self._validate_investor_data(investor_data)
+            if not data_quality.passed:
+                raise ValueError(
+                    f"수급 데이터 품질 미달: {data_quality.score:.1f}/100, "
+                    f"{'; '.join(data_quality.warnings)}"
+                )
             if len(investor_data) < ACCUMULATION_LOOKBACK_DAYS:
                 raise ValueError(f"20일 수급 분석에 필요한 데이터 부족: {len(investor_data)}일")
 
@@ -1238,6 +1583,9 @@ class AccumulationAnalyzer:
                 combined_net_buy_amount=combined_net_buy_amount,
                 net_buy_amount_to_market_cap=net_buy_amount_to_market_cap,
                 net_buy_amount_to_trading_value=net_buy_amount_to_trading_value,
+                data_quality_score=data_quality.score,
+                data_quality_grade=data_quality.grade,
+                data_quality_warnings=data_quality.warnings,
             )
         except Exception as exc:
             logger.warning("%s(%s) 수급 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
@@ -1267,6 +1615,58 @@ class AccumulationAnalyzer:
         data = pd.concat(frames, ignore_index=True)
         data = data.drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
         return data
+
+    @staticmethod
+    def _validate_investor_data(data: pd.DataFrame) -> DataQualityReport:
+        score = 100.0
+        checks: List[str] = []
+        warnings: List[str] = []
+
+        if data is None or data.empty:
+            return DataQualityValidator._report("Naver Finance 수급", 0.0, checks, ["수급 데이터가 비어 있습니다."])
+
+        required = {"date", "close", "institutional_net_buy", "foreign_net_buy"}
+        missing = sorted(required - set(data.columns))
+        if missing:
+            return DataQualityValidator._report(
+                "Naver Finance 수급",
+                0.0,
+                checks,
+                [f"수급 필수 컬럼 누락: {', '.join(missing)}"],
+            )
+
+        frame = data.copy()
+        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+        frame = frame.dropna(subset=["date", "close", "institutional_net_buy", "foreign_net_buy"])
+        if len(frame) < ACCUMULATION_LOOKBACK_DAYS:
+            score -= 45.0
+            warnings.append(f"수급 유효 데이터 부족: {len(frame)}일")
+        else:
+            checks.append(f"수급 유효 데이터 {len(frame)}일")
+
+        latest_date = frame["date"].max() if not frame.empty else None
+        if latest_date is not None:
+            stale_days = (datetime.now().date() - latest_date.date()).days
+            max_staleness_days = env_int("MAX_INVESTOR_DATA_STALENESS_DAYS", MAX_INVESTOR_DATA_STALENESS_DAYS)
+            if stale_days > max_staleness_days:
+                score -= min(40.0, (stale_days - max_staleness_days) * 6.0)
+                warnings.append(f"최신 수급 데이터 지연 {stale_days}일")
+            else:
+                checks.append(f"최신 수급 데이터 {latest_date.strftime('%Y-%m-%d')}")
+
+        close = pd.to_numeric(frame["close"], errors="coerce")
+        if close.dropna().empty or float((close <= 0).mean()) > 0:
+            score -= 30.0
+            warnings.append("수급 테이블 종가 비정상값 포함")
+
+        duplicate_dates = int(frame["date"].duplicated().sum())
+        if duplicate_dates:
+            score -= min(15.0, duplicate_dates / max(len(frame), 1) * 100)
+            warnings.append(f"수급 중복 날짜 {duplicate_dates}건")
+        else:
+            checks.append("수급 중복 날짜 없음")
+
+        return DataQualityValidator._report("Naver Finance 수급", score, checks, warnings)
 
     def _find_investor_table(self, tables: List[pd.DataFrame]) -> pd.DataFrame:
         for table in tables:
@@ -1329,9 +1729,14 @@ class TechnicalAnalyzer:
 
     def analyze(self, stock_meta: StockMeta, market_regime: MarketRegime) -> Optional[TechnicalSnapshot]:
         try:
-            data = self._fetch_price_data(stock_meta.code)
+            data, source_quality = self._fetch_price_data(stock_meta.code)
             if data.empty:
                 raise ValueError("가격 데이터가 비어 있습니다.")
+            if not source_quality.passed:
+                raise ValueError(
+                    f"가격 데이터 품질 미달: {source_quality.score:.1f}/100, "
+                    f"{'; '.join(source_quality.warnings)}"
+                )
 
             required_columns = {"High", "Low", "Close"}
             missing_columns = required_columns - set(data.columns)
@@ -1361,6 +1766,21 @@ class TechnicalAnalyzer:
             prices = prices.dropna()
             if len(prices) < 6:
                 raise ValueError("이동평균/RSI 계산 후 데이터가 부족합니다.")
+            indicator_quality = DataQualityValidator.validate_price_frame(
+                prices,
+                f"{source_quality.source} 지표계산",
+                min_rows=max(6, MIN_HISTORY_DAYS - MA_LONG),
+            )
+            data_quality = DataQualityValidator.merge_reports(
+                source_quality.source,
+                [source_quality, indicator_quality],
+                weights=[0.75, 0.25],
+            )
+            if not data_quality.passed:
+                raise ValueError(
+                    f"지표 계산 데이터 품질 미달: {data_quality.score:.1f}/100, "
+                    f"{'; '.join(data_quality.warnings)}"
+                )
 
             latest = prices.iloc[-1]
             previous = prices.iloc[-2]
@@ -1404,21 +1824,67 @@ class TechnicalAnalyzer:
                 previous_close=previous_close,
                 volume=volume,
                 avg_volume20=avg_volume20,
+                price_source=data_quality.source,
+                data_quality_score=data_quality.score,
+                data_quality_grade=data_quality.grade,
+                data_quality_warnings=data_quality.warnings,
             )
         except Exception as exc:
             logger.warning("%s(%s) 기술적 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
             return None
 
-    def _fetch_price_data(self, code: str) -> pd.DataFrame:
+    def _fetch_price_data(self, code: str) -> tuple[pd.DataFrame, DataQualityReport]:
         if self.kis_provider.enabled:
             try:
-                data = self.kis_provider.fetch_daily_price(code, self.start_date, self.end_date)
+                kis_data = self.kis_provider.fetch_daily_price(code, self.start_date, self.end_date)
+                kis_quality = DataQualityValidator.validate_price_frame(kis_data, "KIS 일봉")
+                if env_bool("ENABLE_PRICE_CROSSCHECK", ENABLE_PRICE_CROSSCHECK):
+                    try:
+                        fdr_data = fdr.DataReader(code, self.start_date, self.end_date)
+                        fdr_quality = DataQualityValidator.validate_price_frame(fdr_data, "FDR 일봉")
+                        cross_quality = DataQualityValidator.compare_price_sources(
+                            kis_data,
+                            fdr_data,
+                            "KIS",
+                            "FDR",
+                        )
+                        combined_quality = DataQualityValidator.merge_reports(
+                            "KIS+FDR 가격",
+                            [kis_quality, fdr_quality, cross_quality],
+                            weights=[0.40, 0.35, 0.25],
+                        )
+                        if not cross_quality.passed and env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION):
+                            combined_quality.passed = False
+                            combined_quality.warnings.insert(0, "KIS/FDR 가격 교차검증 실패")
+                        if not kis_quality.passed and fdr_quality.passed and cross_quality.passed:
+                            logger.debug("%s KIS 품질 미달로 FDR 일봉 데이터 사용", code)
+                            return fdr_data, fdr_quality
+                        kis_latest = latest_frame_date(kis_data)
+                        fdr_latest = latest_frame_date(fdr_data)
+                        if fdr_latest and kis_latest and fdr_latest > kis_latest and fdr_quality.passed:
+                            combined_quality.warnings.insert(
+                                0,
+                                f"FDR가 KIS보다 최신입니다: FDR {fdr_latest.strftime('%Y-%m-%d')}, "
+                                f"KIS {kis_latest.strftime('%Y-%m-%d')}",
+                            )
+                            combined_quality.score = round(max(0.0, combined_quality.score - 3.0), 1)
+                            combined_quality.grade = quality_grade(combined_quality.score)
+                            logger.debug("%s FDR 최신 거래일 우선으로 FDR 일봉 데이터 사용", code)
+                            return fdr_data, combined_quality
+                        logger.debug("%s KIS/FDR 교차검증 후 KIS 일봉 데이터 사용", code)
+                        return kis_data, combined_quality
+                    except Exception as cross_exc:
+                        kis_quality.warnings.append(f"FDR 교차검증 실패: {cross_exc}")
+                        kis_quality.score = round(max(0.0, kis_quality.score - 8.0), 1)
+                        kis_quality.grade = quality_grade(kis_quality.score)
                 logger.debug("%s KIS 일봉 데이터 사용", code)
-                return data
+                return kis_data, kis_quality
             except Exception as exc:
                 logger.warning("%s KIS 일봉 데이터 실패, FDR fallback 사용: %s", code, exc)
 
-        return fdr.DataReader(code, self.start_date, self.end_date)
+        data = fdr.DataReader(code, self.start_date, self.end_date)
+        quality = DataQualityValidator.validate_price_frame(data, "FDR 일봉")
+        return data, quality
 
 
 class FactorScorer:
@@ -1974,6 +2440,12 @@ class RealtimeScanner:
             for item in payload.get("candidates", []):
                 if not isinstance(item, dict):
                     continue
+                data_quality_score = float(item.get("data_quality_score", 0.0))
+                if (
+                    env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION)
+                    and data_quality_score < env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE)
+                ):
+                    continue
                 candidates.append(
                     RealtimeCandidate(
                         stock=StockMeta(**item["stock"]),
@@ -1987,6 +2459,9 @@ class RealtimeScanner:
                         reason=str(item.get("reason", "")),
                         created_at=str(item.get("created_at", "")),
                         score=(FactorScore(**item["score"]) if item.get("score") else None),
+                        data_quality_score=data_quality_score,
+                        data_quality_grade=str(item.get("data_quality_grade", "N/A")),
+                        data_quality_warnings=list(item.get("data_quality_warnings") or []),
                     )
                 )
             return candidates
@@ -2007,6 +2482,7 @@ class RealtimeScanner:
             lines.append(
                 f"- {report.stock.name}({report.stock.code}) "
                 f"{format_factor_score(report.score)}, PBR {report.financials.pbr:.2f}, "
+                f"DQ {report.data_quality_score:.1f}, "
                 f"RSI {report.technicals.rsi:.1f}, "
                 f"20일선 {report.technicals.ma20:,.0f}원"
             )
@@ -2121,6 +2597,7 @@ class RealtimeScanner:
             f"💎 [{candidate.stock.name}({candidate.stock.code})]\n"
             f"🛡️ 시장 국면: {signal.market_regime.summary} / Risk-On\n"
             f"⭐ 종합점수: {format_factor_score(candidate.score)}\n"
+            f"🧾 데이터 신뢰도: {format_data_quality(candidate.data_quality_score, candidate.data_quality_grade, candidate.data_quality_warnings)}\n"
             f"💵 현재가: {signal.current_price:,.0f}원 ({signal.change_rate:+.2f}%)\n"
             f"📈 포착 사유: {signal.summary}\n"
             f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
@@ -2267,6 +2744,19 @@ class FinancialHealthBot:
                 accumulation=accumulation,
                 reason=self._build_reason(metrics, technicals),
             )
+            data_quality = combine_report_data_quality(report)
+            report.data_quality_score = data_quality.score
+            report.data_quality_grade = data_quality.grade
+            report.data_quality_warnings = data_quality.warnings
+            if not data_quality.passed:
+                logger.debug(
+                    "%s(%s) 데이터 품질 %.1f 미달: %s",
+                    report.stock.name,
+                    report.stock.code,
+                    data_quality.score,
+                    "; ".join(data_quality.warnings),
+                )
+                continue
             report.score = self.factor_scorer.score(report, market_regime)
             if report.score.total < min_factor_score:
                 logger.debug(
@@ -2308,6 +2798,7 @@ class FinancialHealthBot:
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
             f"💎 [{report.stock.name}({report.stock.code})]\n"
             f"⭐ 종합점수: {format_factor_score(report.score)}\n"
+            f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}\n"
             f"💰 시가총액: {format_market_cap(financials.market_cap)}\n"
             f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}\n"
             f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
@@ -2347,6 +2838,7 @@ class FinancialHealthBot:
             reports,
             key=lambda report: (
                 -(report.score.total if report.score else 0.0),
+                -report.data_quality_score,
                 -((report.accumulation.net_buy_amount_to_market_cap if report.accumulation and report.accumulation.net_buy_amount_to_market_cap else 0.0)),
                 -((report.accumulation.net_buy_ratio if report.accumulation else 0.0)),
                 report.financials.debt_to_equity,
@@ -2397,6 +2889,7 @@ class FinancialHealthBot:
                     "",
                     f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
                     f"⭐ 종합점수: {format_factor_score(report.score)}",
+                    f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}",
                     f"💰 시가총액: {format_market_cap(financials.market_cap)}",
                     f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}",
                     (
@@ -2469,6 +2962,60 @@ class FinancialHealthBot:
         )
 
 
+def latest_frame_date(frame: pd.DataFrame) -> Optional[pd.Timestamp]:
+    if frame is None or frame.empty:
+        return None
+    index = frame.index
+    if not isinstance(index, pd.DatetimeIndex):
+        index = pd.to_datetime(index, errors="coerce")
+    latest = index.max()
+    if pd.isna(latest):
+        return None
+    return latest
+
+
+def combine_report_data_quality(report: DiscoveryReport) -> DataQualityReport:
+    financial_quality = DataQualityValidator._report(
+        report.financials.financial_source,
+        report.financials.data_quality_score,
+        [],
+        report.financials.data_quality_warnings,
+    )
+    technical_quality = DataQualityValidator._report(
+        report.technicals.price_source or "가격",
+        report.technicals.data_quality_score,
+        [],
+        report.technicals.data_quality_warnings,
+    )
+    reports = [financial_quality, technical_quality]
+    weights = [0.40, 0.45]
+    if report.accumulation is not None:
+        reports.append(
+            DataQualityValidator._report(
+                "수급",
+                report.accumulation.data_quality_score,
+                [],
+                report.accumulation.data_quality_warnings,
+            )
+        )
+        weights.append(0.15)
+    return DataQualityValidator.merge_reports("통합 데이터", reports, weights=weights)
+
+
+def quality_grade(score: float) -> str:
+    if score >= 95:
+        return "A+"
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
 def format_market_cap(value: Optional[float]) -> str:
     if value is None:
         return "N/A"
@@ -2495,6 +3042,15 @@ def format_factor_score(score: Optional[FactorScore]) -> str:
         f"[재무 {score.financial:.1f}, 수급 {score.accumulation:.1f}, "
         f"기술 {score.technical:.1f}, 리스크 {score.risk:.1f}]"
     )
+
+
+def format_data_quality(score: float, grade: str, warnings: Optional[List[str]] = None) -> str:
+    if score <= 0:
+        return "N/A"
+    warning_text = ""
+    if warnings:
+        warning_text = " / 주의: " + "; ".join(warnings[:2])
+    return f"{score:.1f}/100({grade}){warning_text}"
 
 
 def format_accumulation(value: Optional[AccumulationSnapshot]) -> str:

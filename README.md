@@ -56,6 +56,8 @@ KIS_BASE_URL=https://openapi.koreainvestment.com:9443
 KIS_TRADING_ENV=real
 KIS_ACCOUNT_NO=계좌번호 앞 8자리
 KIS_ACCOUNT_PRODUCT_CODE=01
+KIS_MAX_RETRIES=2
+KIS_RETRY_DELAY_SECONDS=1.0
 ```
 
 모의투자 환경을 쓸 때는 아래처럼 바꾸면 됩니다.
@@ -110,6 +112,10 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 `AUTO_TRADE_ORDER_TYPE=00`은 지정가, `01`은 시장가입니다. 기본값은 시가 급등 시 과도한 체결가를 피하기 위해 지정가입니다.
 
 `ENABLE_PYKRX_FUNDAMENTALS=true`이면 KRX 기준 PER/PBR/EPS/BPS를 먼저 보강하고, pykrx 또는 KRX 응답이 불안정하면 자동으로 yfinance 재무제표 계산값만 사용합니다.
+
+데이터 신뢰도 검증은 기본적으로 켜져 있습니다. `STRICT_DATA_VALIDATION=true`이면 가격, 재무, 수급의 통합 데이터 신뢰도가 `MIN_DATA_QUALITY_SCORE` 미만인 종목은 추천/주문 후보에서 제외합니다. `ENABLE_PRICE_CROSSCHECK=true`이면 KIS 일봉과 FDR 일봉의 공통 거래일 종가를 비교해 차이가 `MAX_CROSS_SOURCE_CLOSE_DIFF_PCT`를 넘는지 확인합니다. 두 소스의 종가가 같더라도 최신 거래일이 다르면 경고를 남기고, FDR이 더 최신이면 최신 가격 기준을 우선 사용합니다.
+
+KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 `KIS_RETRY_DELAY_SECONDS` 설정에 따라 재시도합니다. 실제 주문 전송 API는 중복 주문 방지를 위해 자동 재시도하지 않습니다.
 
 ## 실행
 
@@ -220,6 +226,22 @@ REALTIME_MAX_WATCHLIST=50
 - 수급 25점: 상장주식수 대비 순매수, 시총 대비 순매수금액, 양수급 일수, 횡보 여부
 - 기술 25점: RSI 위치, 20/60일선 스프레드, 20일선 근접도, 거래량, 상향 돌파
 - 리스크 20점: 시장 국면, 시장 대비 변동성, ATR 손절 폭, 거래대금
+
+## 데이터 검증
+
+추천 리포트에는 `데이터 신뢰도`가 함께 표시됩니다. 이 점수는 가격 데이터, 재무 데이터, 수급 데이터를 각각 검증한 뒤 통합한 값입니다.
+
+- 가격: 필수 OHLC 컬럼, 최신성, 중복 날짜, 음수/0 가격, OHLC 범위 오류, 거래량, 단일 급변동, KIS/FDR 종가 교차검증
+- 재무: 시가총액, 부채비율, 유동비율, PBR 범위, 영업이익 연속성, pykrx/yfinance PBR 괴리, ROE/성장률 누락 여부
+- 수급: 네이버 수급 테이블 컬럼, 최신성, 중복 날짜, 종가 유효성, 분석 가능 일수
+
+개별 종목의 데이터 소스를 점검하려면 아래 명령을 사용하세요.
+
+```powershell
+.\.venv\Scripts\python.exe validate_data_sources.py --code 005930
+```
+
+이 검증 스크립트는 계좌번호를 마스킹하고 토큰/시크릿은 출력하지 않습니다.
 
 ## 백테스트
 
