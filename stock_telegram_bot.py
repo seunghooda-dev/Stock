@@ -2,7 +2,9 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass
+import importlib
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
@@ -40,6 +42,8 @@ REQUEST_DELAY_SECONDS = 0.15
 KIS_DAILY_CHUNK_DAYS = 60
 FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
+KRX_FUNDAMENTAL_LOOKBACK_DAYS = 10
+ENABLE_PYKRX_FUNDAMENTALS = True
 IMMEDIATE_ALERTS_ENABLED = True
 IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
 
@@ -72,6 +76,8 @@ AUTO_TRADE_PENDING_MAX_AGE_HOURS = 20
 AUTO_TRADE_ORDER_TYPE = "00"  # 00: limit, 01: market
 AUTO_TRADE_EXCHANGE = "KRX"
 AUTO_TRADE_USE_HASHKEY = True
+AUTO_TRADE_USE_RISK_SIZING = True
+AUTO_TRADE_RISK_PER_TRADE_KRW = 50_000
 
 # Liquidity guardrails
 MIN_MARKET_CAP = 50_000_000_000
@@ -91,12 +97,19 @@ ACCUMULATION_PAGES = 5
 MIN_ACCUMULATION_RATIO = 0.001
 MIN_ACCUMULATION_POSITIVE_DAYS = 10
 MAX_SIDEWAYS_PRICE_CHANGE = 0.05
+MIN_ACCUMULATION_AMOUNT_TO_MARKET_CAP = 0.0005
 
 # Financial filters
 MAX_DEBT_TO_EQUITY = 100.0
 MIN_CURRENT_RATIO = 150.0
 MAX_PBR = 1.5
 REQUIRED_PROFIT_YEARS = 3
+ENABLE_VALUE_TRAP_GUARD = True
+MIN_ROE = 5.0
+MIN_OPERATING_MARGIN = 3.0
+MIN_REVENUE_GROWTH_YOY = -5.0
+MIN_OPERATING_INCOME_GROWTH_YOY = -20.0
+MIN_FACTOR_SCORE = 60.0
 
 # Technical filters
 RSI_WINDOW = 14
@@ -151,6 +164,14 @@ class FinancialMetrics:
     operating_income_years: List[float]
     operating_margin: Optional[float]
     market_cap: Optional[float]
+    per: Optional[float] = None
+    roe: Optional[float] = None
+    bps: Optional[float] = None
+    eps: Optional[float] = None
+    revenue_growth_yoy: Optional[float] = None
+    operating_income_growth_yoy: Optional[float] = None
+    financial_source: str = "yfinance"
+    quality_notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -179,6 +200,11 @@ class AccumulationSnapshot:
     positive_days: int
     price_change: float
     summary: str
+    foreign_net_buy_amount: float = 0.0
+    institutional_net_buy_amount: float = 0.0
+    combined_net_buy_amount: float = 0.0
+    net_buy_amount_to_market_cap: Optional[float] = None
+    net_buy_amount_to_trading_value: Optional[float] = None
 
 
 @dataclass
@@ -198,6 +224,18 @@ class DiscoveryReport:
     technicals: TechnicalSnapshot
     accumulation: Optional[AccumulationSnapshot]
     reason: str
+    score: Optional["FactorScore"] = None
+
+
+@dataclass
+class FactorScore:
+    financial: float
+    accumulation: float
+    technical: float
+    risk: float
+    total: float
+    grade: str
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -213,6 +251,8 @@ class OrderPlan:
     exchange: str
     reason: str
     created_at: str
+    risk_per_share: float = 0.0
+    estimated_risk: float = 0.0
 
 
 @dataclass
@@ -233,6 +273,7 @@ class RealtimeCandidate:
     accumulation: Optional[AccumulationSnapshot]
     reason: str
     created_at: str
+    score: Optional[FactorScore] = None
 
 
 @dataclass
@@ -246,9 +287,130 @@ class RealtimeSignal:
     summary: str
 
 
+@dataclass
+class KrxFundamental:
+    code: str
+    per: Optional[float]
+    pbr: Optional[float]
+    eps: Optional[float]
+    bps: Optional[float]
+    roe: Optional[float]
+    source_date: str
+
+
+class KrxFundamentalProvider:
+    def __init__(self) -> None:
+        self.enabled = env_bool("ENABLE_PYKRX_FUNDAMENTALS", ENABLE_PYKRX_FUNDAMENTALS)
+        self._stock_api = None
+        self._frame: Optional[pd.DataFrame] = None
+        self._source_date = ""
+
+    def get(self, code: str) -> Optional[KrxFundamental]:
+        if not self.enabled:
+            return None
+
+        frame = self._load_frame()
+        if frame is None or frame.empty or code not in frame.index:
+            return None
+
+        row = frame.loc[code]
+        per = to_float(row.get("PER"))
+        pbr = to_float(row.get("PBR"))
+        eps = to_float(row.get("EPS"))
+        bps = to_float(row.get("BPS"))
+        roe = None
+        if eps is not None and bps and bps > 0:
+            roe = eps / bps * 100
+
+        return KrxFundamental(
+            code=code,
+            per=per,
+            pbr=pbr,
+            eps=eps,
+            bps=bps,
+            roe=roe,
+            source_date=self._source_date,
+        )
+
+    def _load_frame(self) -> Optional[pd.DataFrame]:
+        if self._frame is not None:
+            return self._frame
+        stock_api = self._load_stock_api()
+        if stock_api is None:
+            self.enabled = False
+            return None
+
+        last_error: Optional[Exception] = None
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+        for offset in range(KRX_FUNDAMENTAL_LOOKBACK_DAYS + 1):
+            date_text = (datetime.now() - timedelta(days=offset)).strftime("%Y%m%d")
+            try:
+                root_logger.setLevel(max(original_level, logging.ERROR))
+                frame = self._fetch_by_date(stock_api, date_text)
+                if frame is not None and not frame.empty:
+                    frame.index = frame.index.map(lambda value: str(value).zfill(6))
+                    self._frame = frame
+                    self._source_date = date_text
+                    logger.info("pykrx 재무 기초지표 로드 완료: %s, %d개", date_text, len(frame))
+                    return self._frame
+            except Exception as exc:
+                last_error = exc
+            finally:
+                root_logger.setLevel(original_level)
+
+        self.enabled = False
+        if last_error:
+            logger.warning("pykrx 재무 기초지표 로드 실패: %s", last_error)
+        else:
+            logger.warning("pykrx 재무 기초지표가 비어 있어 yfinance만 사용합니다.")
+        return None
+
+    def _load_stock_api(self):
+        if not self.enabled:
+            return None
+        if self._stock_api is not None:
+            return self._stock_api
+        try:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                self._stock_api = importlib.import_module("pykrx.stock")
+            return self._stock_api
+        except Exception as exc:
+            logger.warning("pykrx 모듈 로드 실패, yfinance 재무 데이터만 사용합니다: %s", exc)
+            self.enabled = False
+            return None
+
+    @staticmethod
+    def _valid_fundamental_frame(frame: Optional[pd.DataFrame]) -> bool:
+        if frame is None or frame.empty:
+            return False
+        return bool({"BPS", "PER", "PBR", "EPS"} & set(frame.columns))
+
+    @classmethod
+    def _fetch_by_date(cls, stock_api, date_text: str) -> Optional[pd.DataFrame]:
+        try:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                frame = stock_api.get_market_fundamental_by_ticker(date_text, market="ALL")
+            if cls._valid_fundamental_frame(frame):
+                return frame
+        except Exception:
+            pass
+
+        frames: List[pd.DataFrame] = []
+        for market in ("KOSPI", "KOSDAQ"):
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                frame = stock_api.get_market_fundamental_by_ticker(date_text, market=market)
+            if cls._valid_fundamental_frame(frame):
+                frames.append(frame)
+        if not frames:
+            return None
+        return pd.concat(frames)
+
+
 class FinancialScanner:
     def __init__(self) -> None:
         self.cache: Dict[str, Dict[str, object]] = self._load_cache()
+        self.krx_fundamentals = KrxFundamentalProvider()
 
     def fetch_universe(self) -> List[StockMeta]:
         logger.info("KOSPI/KOSDAQ 전종목 목록 수집 시작")
@@ -316,6 +478,7 @@ class FinancialScanner:
 
         yahoo_symbol = self._to_yahoo_symbol(stock_meta)
         try:
+            krx_metrics = self.krx_fundamentals.get(stock_meta.code)
             ticker = yf.Ticker(yahoo_symbol)
             balance_sheet = ticker.balance_sheet
             financials = ticker.financials
@@ -348,12 +511,36 @@ class FinancialScanner:
             if not market_cap or market_cap <= 0:
                 raise ValueError("시가총액 데이터가 없습니다.")
 
-            pbr = market_cap / equity
-            operating_income_years = self._get_recent_operating_income(financials, REQUIRED_PROFIT_YEARS)
-            revenue = self._get_latest_financial_value(financials, ["Total Revenue", "Operating Revenue"])
+            computed_pbr = market_cap / equity
+            pbr = krx_metrics.pbr if krx_metrics and krx_metrics.pbr and krx_metrics.pbr > 0 else computed_pbr
+            per = krx_metrics.per if krx_metrics else None
+            eps = krx_metrics.eps if krx_metrics else None
+            bps = krx_metrics.bps if krx_metrics else None
+            roe = krx_metrics.roe if krx_metrics else None
+
+            operating_income_years = self._get_recent_operating_income(
+                financials,
+                max(REQUIRED_PROFIT_YEARS, 4),
+            )
+            revenue_values = self._get_recent_financial_values(
+                financials,
+                ["Total Revenue", "Operating Revenue"],
+                2,
+            )
+            revenue = revenue_values[0] if revenue_values else None
             operating_margin = None
             if revenue and revenue > 0:
                 operating_margin = operating_income_years[0] / revenue * 100
+            revenue_growth_yoy = self._growth_rate(revenue_values)
+            operating_income_growth_yoy = self._growth_rate(operating_income_years[:2])
+            financial_source = "pykrx+yfinance" if krx_metrics else "yfinance"
+            quality_notes = self._build_quality_notes(
+                pbr=pbr,
+                roe=roe,
+                operating_margin=operating_margin,
+                revenue_growth_yoy=revenue_growth_yoy,
+                operating_income_growth_yoy=operating_income_growth_yoy,
+            )
 
             metrics = FinancialMetrics(
                 code=stock_meta.code,
@@ -365,6 +552,14 @@ class FinancialScanner:
                 operating_income_years=operating_income_years,
                 operating_margin=operating_margin,
                 market_cap=market_cap,
+                per=per,
+                roe=roe,
+                bps=bps,
+                eps=eps,
+                revenue_growth_yoy=revenue_growth_yoy,
+                operating_income_growth_yoy=operating_income_growth_yoy,
+                financial_source=financial_source,
+                quality_notes=quality_notes,
             )
             self.cache[stock_meta.code] = {
                 "cached_at": datetime.now().isoformat(timespec="seconds"),
@@ -390,7 +585,24 @@ class FinancialScanner:
             return False
         if not all(value > 0 for value in metrics.operating_income_years[:REQUIRED_PROFIT_YEARS]):
             return False
+        if env_bool("ENABLE_VALUE_TRAP_GUARD", ENABLE_VALUE_TRAP_GUARD) and self._looks_like_value_trap(metrics):
+            return False
         return True
+
+    @staticmethod
+    def _looks_like_value_trap(metrics: FinancialMetrics) -> bool:
+        if metrics.roe is not None and metrics.roe < MIN_ROE:
+            return True
+        if metrics.operating_margin is not None and metrics.operating_margin < MIN_OPERATING_MARGIN:
+            return True
+        if metrics.revenue_growth_yoy is not None and metrics.revenue_growth_yoy < MIN_REVENUE_GROWTH_YOY:
+            return True
+        if (
+            metrics.operating_income_growth_yoy is not None
+            and metrics.operating_income_growth_yoy < MIN_OPERATING_INCOME_GROWTH_YOY
+        ):
+            return True
+        return False
 
     def _get_cached_metrics(self, code: str) -> Optional[FinancialMetrics]:
         item = self.cache.get(code)
@@ -416,6 +628,14 @@ class FinancialScanner:
                 operating_income_years=[float(value) for value in metrics["operating_income_years"]],
                 operating_margin=self._safe_float(metrics.get("operating_margin")),
                 market_cap=self._safe_float(metrics.get("market_cap")),
+                per=self._safe_float(metrics.get("per")),
+                roe=self._safe_float(metrics.get("roe")),
+                bps=self._safe_float(metrics.get("bps")),
+                eps=self._safe_float(metrics.get("eps")),
+                revenue_growth_yoy=self._safe_float(metrics.get("revenue_growth_yoy")),
+                operating_income_growth_yoy=self._safe_float(metrics.get("operating_income_growth_yoy")),
+                financial_source=str(metrics.get("financial_source", "yfinance")),
+                quality_notes=list(metrics.get("quality_notes") or []),
             )
         except Exception:
             return None
@@ -451,7 +671,7 @@ class FinancialScanner:
             if row_name in financials.index:
                 values = financials.loc[row_name].dropna().tolist()
                 values = [float(value) for value in values if pd.notna(value)]
-                if len(values) >= count:
+                if len(values) >= REQUIRED_PROFIT_YEARS:
                     return values[:count]
         raise ValueError("3년 영업이익 데이터를 찾지 못했습니다.")
 
@@ -463,6 +683,50 @@ class FinancialScanner:
                 if not values.empty:
                     return FinancialScanner._safe_float(values.iloc[0])
         return None
+
+    @staticmethod
+    def _get_recent_financial_values(financials: pd.DataFrame, candidates: List[str], count: int) -> List[float]:
+        for candidate in candidates:
+            if candidate not in financials.index:
+                continue
+            values: List[float] = []
+            for value in financials.loc[candidate].dropna().tolist():
+                numeric = FinancialScanner._safe_float(value)
+                if numeric is not None:
+                    values.append(numeric)
+                if len(values) >= count:
+                    return values
+        return []
+
+    @staticmethod
+    def _growth_rate(values: List[float]) -> Optional[float]:
+        if len(values) < 2:
+            return None
+        current, previous = values[0], values[1]
+        if previous <= 0:
+            return None
+        return (current / previous - 1) * 100
+
+    @staticmethod
+    def _build_quality_notes(
+        pbr: float,
+        roe: Optional[float],
+        operating_margin: Optional[float],
+        revenue_growth_yoy: Optional[float],
+        operating_income_growth_yoy: Optional[float],
+    ) -> List[str]:
+        notes: List[str] = []
+        if pbr < 1.0:
+            notes.append("PBR 1배 미만")
+        if roe is not None:
+            notes.append(f"ROE {roe:.1f}%")
+        if operating_margin is not None:
+            notes.append(f"영업이익률 {operating_margin:.1f}%")
+        if revenue_growth_yoy is not None:
+            notes.append(f"매출 YoY {revenue_growth_yoy:+.1f}%")
+        if operating_income_growth_yoy is not None:
+            notes.append(f"영업이익 YoY {operating_income_growth_yoy:+.1f}%")
+        return notes
 
     @staticmethod
     def _safe_float(value: object) -> Optional[float]:
@@ -911,11 +1175,27 @@ class AccumulationAnalyzer:
 
             recent = investor_data.head(ACCUMULATION_LOOKBACK_DAYS).copy()
             combined = recent["foreign_net_buy"] + recent["institutional_net_buy"]
+            foreign_amount = recent["foreign_net_buy"] * recent["close"]
+            institutional_amount = recent["institutional_net_buy"] * recent["close"]
+            combined_amount = foreign_amount + institutional_amount
             combined_net_buy = float(combined.sum())
             foreign_net_buy = float(recent["foreign_net_buy"].sum())
             institutional_net_buy = float(recent["institutional_net_buy"].sum())
+            foreign_net_buy_amount = float(foreign_amount.sum())
+            institutional_net_buy_amount = float(institutional_amount.sum())
+            combined_net_buy_amount = float(combined_amount.sum())
             positive_days = int((combined > 0).sum())
             net_buy_ratio = combined_net_buy / stock_meta.shares
+            net_buy_amount_to_market_cap = (
+                combined_net_buy_amount / stock_meta.market_cap
+                if stock_meta.market_cap and stock_meta.market_cap > 0
+                else None
+            )
+            net_buy_amount_to_trading_value = (
+                combined_net_buy_amount / stock_meta.trading_value
+                if stock_meta.trading_value and stock_meta.trading_value > 0
+                else None
+            )
 
             latest_close = float(recent.iloc[0]["close"])
             oldest_close = float(recent.iloc[-1]["close"])
@@ -929,12 +1209,19 @@ class AccumulationAnalyzer:
                 return None
             if positive_days < MIN_ACCUMULATION_POSITIVE_DAYS:
                 return None
+            if (
+                net_buy_amount_to_market_cap is not None
+                and net_buy_amount_to_market_cap < MIN_ACCUMULATION_AMOUNT_TO_MARKET_CAP
+            ):
+                return None
             if abs(price_change) > MAX_SIDEWAYS_PRICE_CHANGE:
                 return None
 
             summary = (
                 f"최근 {ACCUMULATION_LOOKBACK_DAYS}일 외국인/기관 합산 순매수 "
                 f"{combined_net_buy:,.0f}주, 상장주식수 대비 {net_buy_ratio * 100:.2f}%, "
+                f"순매수금액 {combined_net_buy_amount / 100_000_000:.1f}억 원, "
+                f"시총 대비 {(net_buy_amount_to_market_cap or 0) * 100:.2f}%, "
                 f"양수급 {positive_days}/{ACCUMULATION_LOOKBACK_DAYS}일"
             )
             return AccumulationSnapshot(
@@ -946,6 +1233,11 @@ class AccumulationAnalyzer:
                 positive_days=positive_days,
                 price_change=price_change,
                 summary=summary,
+                foreign_net_buy_amount=foreign_net_buy_amount,
+                institutional_net_buy_amount=institutional_net_buy_amount,
+                combined_net_buy_amount=combined_net_buy_amount,
+                net_buy_amount_to_market_cap=net_buy_amount_to_market_cap,
+                net_buy_amount_to_trading_value=net_buy_amount_to_trading_value,
             )
         except Exception as exc:
             logger.warning("%s(%s) 수급 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
@@ -1129,6 +1421,115 @@ class TechnicalAnalyzer:
         return fdr.DataReader(code, self.start_date, self.end_date)
 
 
+class FactorScorer:
+    def score(self, report: DiscoveryReport, market_regime: MarketRegime) -> FactorScore:
+        financial = self._financial_score(report.financials)
+        accumulation = self._accumulation_score(report.accumulation)
+        technical = self._technical_score(report.technicals)
+        risk = self._risk_score(report, market_regime)
+        total = financial + accumulation + technical + risk
+        grade = self._grade(total)
+        notes = self._notes(report)
+        return FactorScore(
+            financial=round(financial, 1),
+            accumulation=round(accumulation, 1),
+            technical=round(technical, 1),
+            risk=round(risk, 1),
+            total=round(total, 1),
+            grade=grade,
+            notes=notes,
+        )
+
+    @staticmethod
+    def _financial_score(metrics: FinancialMetrics) -> float:
+        score = 0.0
+        score += clamp((MAX_PBR - metrics.pbr) / MAX_PBR * 7.0, 0.0, 7.0)
+        score += clamp((MAX_DEBT_TO_EQUITY - metrics.debt_to_equity) / MAX_DEBT_TO_EQUITY * 6.0, 0.0, 6.0)
+        score += clamp((metrics.current_ratio - 100.0) / 200.0 * 4.0, 0.0, 4.0)
+        if metrics.roe is not None:
+            score += clamp(metrics.roe / 15.0 * 6.0, 0.0, 6.0)
+        else:
+            score += 3.0
+        if metrics.operating_margin is not None:
+            score += clamp(metrics.operating_margin / 12.0 * 4.0, 0.0, 4.0)
+        else:
+            score += 2.0
+        if metrics.revenue_growth_yoy is not None:
+            score += clamp((metrics.revenue_growth_yoy + 5.0) / 20.0 * 3.0, 0.0, 3.0)
+        else:
+            score += 1.5
+        return clamp(score, 0.0, 30.0)
+
+    @staticmethod
+    def _accumulation_score(accumulation: Optional[AccumulationSnapshot]) -> float:
+        if accumulation is None:
+            return 0.0
+        score = 0.0
+        score += clamp(accumulation.net_buy_ratio / 0.01 * 7.0, 0.0, 7.0)
+        if accumulation.net_buy_amount_to_market_cap is not None:
+            score += clamp(accumulation.net_buy_amount_to_market_cap / 0.005 * 7.0, 0.0, 7.0)
+        score += clamp(accumulation.positive_days / ACCUMULATION_LOOKBACK_DAYS * 5.0, 0.0, 5.0)
+        score += clamp((MAX_SIDEWAYS_PRICE_CHANGE - abs(accumulation.price_change)) / MAX_SIDEWAYS_PRICE_CHANGE * 4.0, 0.0, 4.0)
+        if accumulation.combined_net_buy_amount > 0:
+            leader = max(abs(accumulation.foreign_net_buy_amount), abs(accumulation.institutional_net_buy_amount))
+            balance = leader / max(abs(accumulation.combined_net_buy_amount), 1.0)
+            score += 2.0 if balance < 0.85 else 1.0
+        return clamp(score, 0.0, 25.0)
+
+    @staticmethod
+    def _technical_score(technicals: TechnicalSnapshot) -> float:
+        score = 0.0
+        score += clamp((15.0 - abs(technicals.rsi - 45.0)) / 15.0 * 7.0, 0.0, 7.0)
+        ma_spread = technicals.ma20 / technicals.ma60 - 1 if technicals.ma60 > 0 else 0.0
+        score += clamp(ma_spread / 0.10 * 6.0, 0.0, 6.0)
+        ma_distance = abs(technicals.current_price / technicals.ma20 - 1) if technicals.ma20 > 0 else 1.0
+        score += clamp((MAX_DISTANCE_ABOVE_MA20 - ma_distance) / MAX_DISTANCE_ABOVE_MA20 * 5.0, 0.0, 5.0)
+        volume_ratio = technicals.volume / technicals.avg_volume20 if technicals.avg_volume20 > 0 else 1.0
+        score += clamp(volume_ratio / 2.0 * 4.0, 0.0, 4.0)
+        score += 3.0 if "상향 돌파" in technicals.trend_summary else 1.5
+        return clamp(score, 0.0, 25.0)
+
+    @staticmethod
+    def _risk_score(report: DiscoveryReport, market_regime: MarketRegime) -> float:
+        technicals = report.technicals
+        score = 0.0
+        if market_regime.risk_on:
+            score += 3.0
+        if market_regime.volatility > 0:
+            score += clamp((1.3 - technicals.volatility / market_regime.volatility) / 1.3 * 7.0, 0.0, 7.0)
+        risk_pct = (
+            (technicals.current_price - technicals.stop_loss) / technicals.current_price
+            if technicals.current_price > 0
+            else 1.0
+        )
+        score += clamp((0.12 - risk_pct) / 0.12 * 6.0, 0.0, 6.0)
+        if report.stock.trading_value:
+            score += clamp(report.stock.trading_value / 5_000_000_000 * 4.0, 0.0, 4.0)
+        return clamp(score, 0.0, 20.0)
+
+    @staticmethod
+    def _notes(report: DiscoveryReport) -> List[str]:
+        notes = []
+        if report.financials.quality_notes:
+            notes.extend(report.financials.quality_notes[:3])
+        if report.accumulation:
+            notes.append(f"수급 {report.accumulation.net_buy_amount_to_market_cap or 0:.2%}/시총")
+        notes.append(report.technicals.trend_summary)
+        return notes[:5]
+
+    @staticmethod
+    def _grade(total: float) -> str:
+        if total >= 85:
+            return "A+"
+        if total >= 75:
+            return "A"
+        if total >= 65:
+            return "B+"
+        if total >= MIN_FACTOR_SCORE:
+            return "B"
+        return "C"
+
+
 class Notifier:
     MAX_MESSAGE_LENGTH = 3900
 
@@ -1209,6 +1610,8 @@ class TradingEngine:
         self.order_type = os.getenv("AUTO_TRADE_ORDER_TYPE", AUTO_TRADE_ORDER_TYPE).strip() or "01"
         self.exchange = os.getenv("AUTO_TRADE_EXCHANGE", AUTO_TRADE_EXCHANGE).strip() or "KRX"
         self.use_hashkey = env_bool("AUTO_TRADE_USE_HASHKEY", AUTO_TRADE_USE_HASHKEY)
+        self.use_risk_sizing = env_bool("AUTO_TRADE_USE_RISK_SIZING", AUTO_TRADE_USE_RISK_SIZING)
+        self.risk_per_trade_krw = env_float("AUTO_TRADE_RISK_PER_TRADE_KRW", AUTO_TRADE_RISK_PER_TRADE_KRW)
 
     def prepare_buy_plans(self, reports: List[DiscoveryReport], market_regime: MarketRegime) -> List[OrderPlan]:
         if not market_regime.risk_on or not reports:
@@ -1231,12 +1634,18 @@ class TradingEngine:
 
             remaining_exposure = max(0.0, self.max_portfolio_exposure_krw - planned_value)
             budget = min(self.order_budget_krw, self.max_order_value_krw, remaining_exposure)
-            quantity = int(budget // current_price)
+            budget_quantity = int(budget // current_price)
+            risk_per_share = max(0.0, current_price - report.technicals.stop_loss)
+            risk_quantity = budget_quantity
+            if self.use_risk_sizing and risk_per_share > 0 and self.risk_per_trade_krw > 0:
+                risk_quantity = int(self.risk_per_trade_krw // risk_per_share)
+            quantity = min(budget_quantity, risk_quantity)
             if quantity < 1:
-                logger.info("%s(%s) 주문 예산 부족으로 자동매매 후보 제외", report.stock.name, report.stock.code)
+                logger.info("%s(%s) 주문 예산/리스크 한도 부족으로 자동매매 후보 제외", report.stock.name, report.stock.code)
                 continue
 
             estimated_value = quantity * current_price
+            estimated_risk = quantity * risk_per_share
             plans.append(
                 OrderPlan(
                     side="buy",
@@ -1250,6 +1659,8 @@ class TradingEngine:
                     exchange=self.exchange,
                     reason=report.reason,
                     created_at=datetime.now().isoformat(timespec="seconds"),
+                    risk_per_share=risk_per_share,
+                    estimated_risk=estimated_risk,
                 )
             )
             planned_value += estimated_value
@@ -1320,7 +1731,8 @@ class TradingEngine:
         account = mask_account(self.kis_provider.account_no, self.kis_provider.account_product_code)
         return (
             f"{mode}, {self.kis_provider.trading_env}, 계좌 {account}, "
-            f"주문시간 {self.run_time}, 1회 최대 {self.max_orders_per_run}건"
+            f"주문시간 {self.run_time}, 1회 최대 {self.max_orders_per_run}건, "
+            f"종목당 위험한도 {self.risk_per_trade_krw:,.0f}원"
         )
 
     def _execute_plan(self, plan: OrderPlan) -> OrderResult:
@@ -1395,7 +1807,7 @@ class TradingEngine:
                     "",
                     f"[{plan.name}({plan.code})] {result.status}{order_no}",
                     f"수량 {plan.quantity}주, 예상금액 {plan.estimated_value:,.0f}원",
-                    f"손절 기준 {plan.stop_loss:,.0f}원",
+                    f"손절 기준 {plan.stop_loss:,.0f}원, 예상위험 {plan.estimated_risk:,.0f}원",
                     result.message,
                 ]
             )
@@ -1497,6 +1909,7 @@ class RealtimeScanner:
                 accumulation=report.accumulation,
                 reason=report.reason,
                 created_at=datetime.now().isoformat(timespec="seconds"),
+                score=report.score,
             )
             for report in ranked
         ]
@@ -1573,6 +1986,7 @@ class RealtimeScanner:
                         ),
                         reason=str(item.get("reason", "")),
                         created_at=str(item.get("created_at", "")),
+                        score=(FactorScore(**item["score"]) if item.get("score") else None),
                     )
                 )
             return candidates
@@ -1592,7 +2006,8 @@ class RealtimeScanner:
         for report in FinancialHealthBot._rank_reports(reports)[: min(5, self.max_watchlist)]:
             lines.append(
                 f"- {report.stock.name}({report.stock.code}) "
-                f"PBR {report.financials.pbr:.2f}, RSI {report.technicals.rsi:.1f}, "
+                f"{format_factor_score(report.score)}, PBR {report.financials.pbr:.2f}, "
+                f"RSI {report.technicals.rsi:.1f}, "
                 f"20일선 {report.technicals.ma20:,.0f}원"
             )
         return "\n".join(lines)
@@ -1705,10 +2120,12 @@ class RealtimeScanner:
             "🚨 장중 실시간 시그널\n"
             f"💎 [{candidate.stock.name}({candidate.stock.code})]\n"
             f"🛡️ 시장 국면: {signal.market_regime.summary} / Risk-On\n"
+            f"⭐ 종합점수: {format_factor_score(candidate.score)}\n"
             f"💵 현재가: {signal.current_price:,.0f}원 ({signal.change_rate:+.2f}%)\n"
             f"📈 포착 사유: {signal.summary}\n"
             f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
-            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}\n"
+            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}, "
+            f"ROE {format_optional_percent(financials.roe)}\n"
             f"📌 기준: RSI {technicals.rsi:.1f}, 20일선 {technicals.ma20:,.0f}원, "
             f"거래량 페이스 {signal.volume_pace_ratio:.1f}배\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원\n"
@@ -1747,6 +2164,7 @@ class FinancialHealthBot:
         self.market_regime_filter = MarketRegimeFilter()
         self.technical_analyzer = TechnicalAnalyzer(self.kis_provider)
         self.accumulation_analyzer = AccumulationAnalyzer()
+        self.factor_scorer = FactorScorer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
         self.realtime_scanner = RealtimeScanner(self.kis_provider, self.notifier)
@@ -1824,6 +2242,7 @@ class FinancialHealthBot:
         financially_strong = self.financial_scanner.scan(universe)
 
         reports: List[DiscoveryReport] = []
+        min_factor_score = env_float("MIN_FACTOR_SCORE", MIN_FACTOR_SCORE)
         for metrics in financially_strong:
             stock_meta = stock_map.get(metrics.code)
             if stock_meta is None:
@@ -1848,6 +2267,15 @@ class FinancialHealthBot:
                 accumulation=accumulation,
                 reason=self._build_reason(metrics, technicals),
             )
+            report.score = self.factor_scorer.score(report, market_regime)
+            if report.score.total < min_factor_score:
+                logger.debug(
+                    "%s(%s) 팩터 점수 %.1f 미달",
+                    report.stock.name,
+                    report.stock.code,
+                    report.score.total,
+                )
+                continue
             reports.append(report)
             if send_immediate_alerts:
                 self._send_immediate_alert_if_needed(report, market_regime)
@@ -1879,10 +2307,12 @@ class FinancialHealthBot:
             "🚨 종목 발굴 즉시 알림\n"
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
             f"💎 [{report.stock.name}({report.stock.code})]\n"
+            f"⭐ 종합점수: {format_factor_score(report.score)}\n"
             f"💰 시가총액: {format_market_cap(financials.market_cap)}\n"
             f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}\n"
             f"📊 재무: 부채비율 {financials.debt_to_equity:.1f}%, "
-            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}\n"
+            f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}, "
+            f"ROE {format_optional_percent(financials.roe)}\n"
             f"📈 타점: {technicals.trend_summary} "
             f"(현재가 {technicals.current_price:,.0f}원, RSI {technicals.rsi:.1f})\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원 "
@@ -1916,11 +2346,11 @@ class FinancialHealthBot:
         return sorted(
             reports,
             key=lambda report: (
-                report.financials.pbr,
+                -(report.score.total if report.score else 0.0),
+                -((report.accumulation.net_buy_amount_to_market_cap if report.accumulation and report.accumulation.net_buy_amount_to_market_cap else 0.0)),
                 -((report.accumulation.net_buy_ratio if report.accumulation else 0.0)),
-                report.technicals.volatility,
                 report.financials.debt_to_equity,
-                -report.technicals.rsi,
+                report.technicals.volatility,
             ),
         )
 
@@ -1966,6 +2396,7 @@ class FinancialHealthBot:
                 [
                     "",
                     f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
+                    f"⭐ 종합점수: {format_factor_score(report.score)}",
                     f"💰 시가총액: {format_market_cap(financials.market_cap)}",
                     f"💧 당일 거래대금: {format_market_cap(report.stock.trading_value)}",
                     (
@@ -1973,7 +2404,15 @@ class FinancialHealthBot:
                         f"부채비율 {financials.debt_to_equity:.1f}%, "
                         f"유동비율 {financials.current_ratio:.1f}%, "
                         f"PBR {financials.pbr:.2f}, "
+                        f"PER {format_optional_number(financials.per)}, "
+                        f"ROE {format_optional_percent(financials.roe)}, "
                         f"영업이익률 {format_optional_percent(financials.operating_margin)}"
+                    ),
+                    (
+                        "🧪 가치함정 점검: "
+                        f"매출 YoY {format_optional_percent(financials.revenue_growth_yoy)}, "
+                        f"영업이익 YoY {format_optional_percent(financials.operating_income_growth_yoy)}, "
+                        f"소스 {financials.financial_source}"
                     ),
                     (
                         "📈 기술적 상황: "
@@ -2042,12 +2481,30 @@ def format_optional_percent(value: Optional[float]) -> str:
     return f"{value:.1f}%"
 
 
+def format_optional_number(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.1f}"
+
+
+def format_factor_score(score: Optional[FactorScore]) -> str:
+    if score is None:
+        return "N/A"
+    return (
+        f"{score.total:.1f}/100({score.grade}) "
+        f"[재무 {score.financial:.1f}, 수급 {score.accumulation:.1f}, "
+        f"기술 {score.technical:.1f}, 리스크 {score.risk:.1f}]"
+    )
+
+
 def format_accumulation(value: Optional[AccumulationSnapshot]) -> str:
     if value is None:
         return "N/A"
     return (
         f"{value.days}일 외국인/기관 합산 {value.combined_net_buy:,.0f}주 순매수, "
         f"상장주식수 대비 {value.net_buy_ratio * 100:.2f}%, "
+        f"순매수금액 {value.combined_net_buy_amount / 100_000_000:.1f}억 원, "
+        f"시총 대비 {(value.net_buy_amount_to_market_cap or 0) * 100:.2f}%, "
         f"주가 변화 {value.price_change * 100:+.1f}%"
     )
 
@@ -2056,8 +2513,13 @@ def format_order_plan(plan: OrderPlan) -> str:
     order_type = "시장가" if plan.order_type == "01" else "지정가"
     return (
         f"- [{plan.name}({plan.code})] {order_type} {plan.quantity}주, "
-        f"예상 {plan.estimated_value:,.0f}원, 손절 {plan.stop_loss:,.0f}원"
+        f"예상 {plan.estimated_value:,.0f}원, "
+        f"예상위험 {plan.estimated_risk:,.0f}원, 손절 {plan.stop_loss:,.0f}원"
     )
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 def env_bool(name: str, default: bool) -> bool:

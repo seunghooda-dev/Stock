@@ -1,6 +1,7 @@
 finance-datareader
 html5lib
 pandas
+pykrx
 python-dotenv
 ta
 requests

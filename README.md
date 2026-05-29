@@ -6,6 +6,7 @@ KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평
 
 - `FinanceDataReader`: KRX 종목 목록, 시가총액, 국내 주가 데이터
 - `KIS Open API`: 한국투자증권 국내주식 일봉/현재가 데이터
+- `pykrx`: KRX 기준 PER/PBR/EPS/BPS 보강 및 ROE 추정
 - `yfinance`: 재무제표, 대차대조표, 손익계산서
 - `Naver Finance`: 최근 외국인/기관 순매매 데이터
 
@@ -90,6 +91,8 @@ AUTO_TRADE_ORDER_BUDGET_KRW=300000
 AUTO_TRADE_MAX_ORDER_VALUE_KRW=500000
 AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW=1000000
 AUTO_TRADE_PENDING_MAX_AGE_HOURS=20
+AUTO_TRADE_USE_RISK_SIZING=true
+AUTO_TRADE_RISK_PER_TRADE_KRW=50000
 ```
 
 실제 주문을 보내려면 아래 값을 모두 의도적으로 바꿔야 합니다.
@@ -105,6 +108,8 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 모의투자 주문을 먼저 검증하려면 `KIS_TRADING_ENV=demo`, 모의투자용 `APP_KEY/APP_SECRET`, 모의투자 계좌번호, 모의투자 도메인을 사용하세요.
 
 `AUTO_TRADE_ORDER_TYPE=00`은 지정가, `01`은 시장가입니다. 기본값은 시가 급등 시 과도한 체결가를 피하기 위해 지정가입니다.
+
+`ENABLE_PYKRX_FUNDAMENTALS=true`이면 KRX 기준 PER/PBR/EPS/BPS를 먼저 보강하고, pykrx 또는 KRX 응답이 불안정하면 자동으로 yfinance 재무제표 계산값만 사용합니다.
 
 ## 실행
 
@@ -170,6 +175,8 @@ REALTIME_MAX_WATCHLIST=50
 - 유동비율 150% 이상
 - 영업이익 3년 연속 흑자
 - PBR 1.5 미만
+- pykrx PER/PBR/EPS/BPS로 yfinance 재무제표를 보강
+- ROE, 영업이익률, 매출 YoY, 영업이익 YoY로 가치함정 여부 점검
 
 ## 시장 국면 필터
 
@@ -193,6 +200,7 @@ REALTIME_MAX_WATCHLIST=50
 - 자동매매는 1회 주문 수, 종목당 예산, 1회 총 노출 한도, 동일 종목 재진입 쿨다운을 적용합니다.
 - 주문 실행 직전에도 시장 국면을 재확인하고, Risk-Off면 대기 주문을 폐기합니다.
 - 실전 주문은 `AUTO_TRADE_CONFIRM_REAL_TRADING=YES`가 없으면 코드상에서 차단됩니다.
+- `AUTO_TRADE_USE_RISK_SIZING=true`일 때는 고정 매수금액만 보지 않고, `매수가 - ATR 손절가` 기준으로 종목당 예상 손실이 `AUTO_TRADE_RISK_PER_TRADE_KRW`를 넘지 않게 수량을 줄입니다.
 
 ## 수급 매집 필터
 
@@ -200,8 +208,28 @@ REALTIME_MAX_WATCHLIST=50
 
 - 최근 20거래일 외국인/기관 합산 순매수
 - 합산 순매수량이 상장주식수 대비 0.1% 이상
+- 합산 순매수금액이 시가총액 대비 0.05% 이상
 - 최근 20거래일 중 10일 이상 양수급
 - 20거래일 주가 변화율이 ±5% 이내
+
+## 팩터 점수화
+
+최종 후보는 단순 조건 통과가 아니라 100점 만점 점수로 다시 정렬합니다. 기본 통과선은 `MIN_FACTOR_SCORE=60`입니다.
+
+- 재무 30점: PBR, 부채비율, 유동비율, ROE, 영업이익률, 매출 성장
+- 수급 25점: 상장주식수 대비 순매수, 시총 대비 순매수금액, 양수급 일수, 횡보 여부
+- 기술 25점: RSI 위치, 20/60일선 스프레드, 20일선 근접도, 거래량, 상향 돌파
+- 리스크 20점: 시장 국면, 시장 대비 변동성, ATR 손절 폭, 거래대금
+
+## 백테스트
+
+전략 조건이 과거 데이터에서 어떻게 작동했는지 빠르게 점검할 수 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe backtest_stock_bot.py --years 3 --max-stocks 200
+```
+
+결과는 `cache/backtest_trades.csv`, `cache/backtest_summary.json`에 저장됩니다. 이 백테스트는 가격/거래량/시장 국면 기반의 구조 검증용이며, 과거 시점별 재무제표와 수급 데이터까지 완전 재현하는 회계 기준 백테스트는 아닙니다.
 
 ## 구조
 
@@ -211,6 +239,7 @@ REALTIME_MAX_WATCHLIST=50
 - `RealtimeScanner`: 아침 후보군을 장중 KIS 현재가로 감시하고 조건 포착 시 즉시 알림
 - `MarketRegimeFilter`: KOSPI/KOSDAQ150 200일 이동평균선 기반 Risk-On/Risk-Off 판단
 - `TechnicalAnalyzer`: RSI, 20일/60일 이동평균선, 저변동성 기반 기술적 분석
+- `FactorScorer`: 재무/수급/기술/리스크를 100점 만점으로 점수화
 - `AccumulationAnalyzer`: 네이버 금융 외국인/기관 순매매 기반 수급 매집 분석
 - `Notifier`: 텔레그램 리포트 전송
 - `FinancialHealthBot`: 전체 실행 흐름과 스케줄 관리
