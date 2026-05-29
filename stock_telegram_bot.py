@@ -22,6 +22,12 @@ from ta.volatility import AverageTrueRange
 TELEGRAM_TOKEN = ""
 CHAT_ID = ""
 
+# Korea Investment Securities Open API settings.
+# Fill these directly, or set KIS_APP_KEY / KIS_APP_SECRET env vars.
+KIS_APP_KEY = ""
+KIS_APP_SECRET = ""
+KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+
 # Scanner settings
 RUN_TIME_KST = "16:00"
 LOOKBACK_DAYS = 220
@@ -73,6 +79,7 @@ EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
 CACHE_DIR = Path("cache")
 FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
 ALERT_CACHE_FILE = CACHE_DIR / "alerts.json"
+KIS_TOKEN_CACHE_FILE = CACHE_DIR / "kis_token.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -447,6 +454,162 @@ class MarketRegimeFilter:
         )
 
 
+class KISDataProvider:
+    TOKEN_PATH = "/oauth2/tokenP"
+    DAILY_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+    CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+
+    def __init__(self) -> None:
+        load_dotenv()
+        self.app_key = KIS_APP_KEY or os.getenv("KIS_APP_KEY", "")
+        self.app_secret = KIS_APP_SECRET or os.getenv("KIS_APP_SECRET", "")
+        self.base_url = os.getenv("KIS_BASE_URL", KIS_BASE_URL).rstrip("/")
+        self.session = requests.Session()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.app_key and self.app_secret)
+
+    def fetch_daily_price(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        if not self.enabled:
+            raise RuntimeError("KIS_APP_KEY 또는 KIS_APP_SECRET이 설정되지 않았습니다.")
+
+        payload = self._get(
+            path=self.DAILY_PRICE_PATH,
+            tr_id="FHKST03010100",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": compact_date(start_date),
+                "FID_INPUT_DATE_2": compact_date(end_date),
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": "0",
+            },
+        )
+        rows = payload.get("output2") or []
+        if not rows:
+            raise ValueError(f"{code} KIS 일봉 데이터가 비어 있습니다.")
+
+        records = []
+        for row in rows:
+            records.append(
+                {
+                    "Date": pd.to_datetime(str(row.get("stck_bsop_date")), format="%Y%m%d", errors="coerce"),
+                    "Open": to_float(row.get("stck_oprc")),
+                    "High": to_float(row.get("stck_hgpr")),
+                    "Low": to_float(row.get("stck_lwpr")),
+                    "Close": to_float(row.get("stck_clpr")),
+                    "Volume": to_float(row.get("acml_vol")),
+                    "Amount": to_float(row.get("acml_tr_pbmn")),
+                }
+            )
+
+        data = pd.DataFrame(records).dropna(subset=["Date", "Open", "High", "Low", "Close"])
+        if data.empty:
+            raise ValueError(f"{code} KIS 일봉 데이터 파싱 결과가 비어 있습니다.")
+
+        data = data.set_index("Date").sort_index()
+        return data[["Open", "High", "Low", "Close", "Volume", "Amount"]]
+
+    def fetch_current_price(self, code: str) -> Dict[str, Optional[float]]:
+        if not self.enabled:
+            raise RuntimeError("KIS_APP_KEY 또는 KIS_APP_SECRET이 설정되지 않았습니다.")
+
+        payload = self._get(
+            path=self.CURRENT_PRICE_PATH,
+            tr_id="FHKST01010100",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+            },
+        )
+        output = payload.get("output") or {}
+        return {
+            "current_price": to_float(output.get("stck_prpr")),
+            "volume": to_float(output.get("acml_vol")),
+            "trading_value": to_float(output.get("acml_tr_pbmn")),
+        }
+
+    def _get(self, path: str, tr_id: str, params: Dict[str, str]) -> Dict[str, object]:
+        token = self._get_access_token()
+        response = self.session.get(
+            f"{self.base_url}{path}",
+            headers={
+                "authorization": f"Bearer {token}",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+                "tr_id": tr_id,
+                "custtype": "P",
+            },
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if str(payload.get("rt_cd", "0")) != "0":
+            raise RuntimeError(f"KIS API 오류 {payload.get('msg_cd')}: {payload.get('msg1')}")
+        return payload
+
+    def _get_access_token(self) -> str:
+        cached_token = self._load_cached_token()
+        if cached_token:
+            return cached_token
+
+        response = self.session.post(
+            f"{self.base_url}{self.TOKEN_PATH}",
+            headers={"content-type": "application/json"},
+            json={
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,
+                "appsecret": self.app_secret,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get("access_token")
+        if not token:
+            raise RuntimeError(f"KIS 접근토큰 발급 실패: {payload}")
+
+        expires_at = datetime.now() + timedelta(seconds=int(payload.get("expires_in", 86400)) - 300)
+        self._save_cached_token(str(token), expires_at)
+        return str(token)
+
+    def _load_cached_token(self) -> Optional[str]:
+        if not KIS_TOKEN_CACHE_FILE.exists():
+            return None
+        try:
+            with KIS_TOKEN_CACHE_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            if data.get("base_url") != self.base_url and data.get("base_url"):
+                return None
+            expires_at = datetime.fromisoformat(str(data.get("expires_at")))
+            if datetime.now() >= expires_at:
+                return None
+            token = data.get("access_token")
+            return str(token) if token else None
+        except Exception as exc:
+            logger.warning("KIS 토큰 캐시 로드 실패: %s", exc)
+            return None
+
+    def _save_cached_token(self, token: str, expires_at: datetime) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with KIS_TOKEN_CACHE_FILE.open("w", encoding="utf-8") as file:
+                json.dump(
+                    {
+                        "access_token": token,
+                        "expires_at": expires_at.isoformat(timespec="seconds"),
+                        "base_url": self.base_url,
+                    },
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as exc:
+            logger.warning("KIS 토큰 캐시 저장 실패: %s", exc)
+
+
 class AccumulationAnalyzer:
     NAVER_URL = "https://finance.naver.com/item/frgn.naver"
     USER_AGENT = "Mozilla/5.0"
@@ -576,6 +739,9 @@ class AccumulationAnalyzer:
 
 
 class TechnicalAnalyzer:
+    def __init__(self, kis_provider: Optional[KISDataProvider] = None) -> None:
+        self.kis_provider = kis_provider or KISDataProvider()
+
     @property
     def start_date(self) -> str:
         return (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
@@ -586,7 +752,7 @@ class TechnicalAnalyzer:
 
     def analyze(self, stock_meta: StockMeta, market_regime: MarketRegime) -> Optional[TechnicalSnapshot]:
         try:
-            data = fdr.DataReader(stock_meta.code, self.start_date, self.end_date)
+            data = self._fetch_price_data(stock_meta.code)
             if data.empty:
                 raise ValueError("가격 데이터가 비어 있습니다.")
 
@@ -653,6 +819,17 @@ class TechnicalAnalyzer:
             logger.warning("%s(%s) 기술적 분석 실패: %s", stock_meta.name, stock_meta.code, exc)
             return None
 
+    def _fetch_price_data(self, code: str) -> pd.DataFrame:
+        if self.kis_provider.enabled:
+            try:
+                data = self.kis_provider.fetch_daily_price(code, self.start_date, self.end_date)
+                logger.debug("%s KIS 일봉 데이터 사용", code)
+                return data
+            except Exception as exc:
+                logger.warning("%s KIS 일봉 데이터 실패, FDR fallback 사용: %s", code, exc)
+
+        return fdr.DataReader(code, self.start_date, self.end_date)
+
 
 class Notifier:
     MAX_MESSAGE_LENGTH = 3900
@@ -710,9 +887,10 @@ class FinancialHealthBot:
         load_dotenv()
         token = TELEGRAM_TOKEN or os.getenv("TELEGRAM_TOKEN", "")
         chat_id = CHAT_ID or os.getenv("TELEGRAM_CHAT_ID", "")
+        self.kis_provider = KISDataProvider()
         self.financial_scanner = FinancialScanner()
         self.market_regime_filter = MarketRegimeFilter()
-        self.technical_analyzer = TechnicalAnalyzer()
+        self.technical_analyzer = TechnicalAnalyzer(self.kis_provider)
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
@@ -943,6 +1121,22 @@ def format_accumulation(value: Optional[AccumulationSnapshot]) -> str:
         f"상장주식수 대비 {value.net_buy_ratio * 100:.2f}%, "
         f"주가 변화 {value.price_change * 100:+.1f}%"
     )
+
+
+def compact_date(value: str) -> str:
+    return value.replace("-", "")
+
+
+def to_float(value: object) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        text = str(value).replace(",", "").strip()
+        if not text:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
 
 
 def annualized_volatility(close: pd.Series) -> float:

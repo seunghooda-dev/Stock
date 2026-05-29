@@ -5,6 +5,7 @@ KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평
 ## 데이터 소스
 
 - `FinanceDataReader`: KRX 종목 목록, 시가총액, 국내 주가 데이터
+- `KIS Open API`: 한국투자증권 국내주식 일봉/현재가 데이터
 - `yfinance`: 재무제표, 대차대조표, 손익계산서
 - `Naver Finance`: 최근 외국인/기관 순매매 데이터
 
@@ -33,6 +34,24 @@ notepad .env
 ```text
 TELEGRAM_TOKEN=텔레그램 봇 토큰
 TELEGRAM_CHAT_ID=텔레그램 채팅 ID
+```
+
+## 한국투자증권 API 설정
+
+KIS Developers에서 API 신청 후 발급받은 `APP_KEY`, `APP_SECRET`을 `.env`에 넣으면 개별 종목 일봉 데이터는 한국투자증권 API를 우선 사용합니다. 키가 없거나 호출이 실패하면 기존 `FinanceDataReader`로 자동 fallback됩니다.
+
+```text
+KIS_APP_KEY=한국투자증권 APP KEY
+KIS_APP_SECRET=한국투자증권 APP SECRET
+KIS_BASE_URL=https://openapi.koreainvestment.com:9443
+```
+
+모의투자 환경을 쓸 때는 `KIS_BASE_URL`을 한국투자증권 모의투자 도메인으로 바꾸면 됩니다.
+
+연결 확인:
+
+```powershell
+.\.venv\Scripts\python.exe test_kis_connection.py
 ```
 
 ## 실행
@@ -94,6 +113,7 @@ TELEGRAM_CHAT_ID=텔레그램 채팅 ID
 ## 구조
 
 - `FinancialScanner`: 전종목 유니버스 구성, yfinance 재무제표 수집, 재무 필터링
+- `KISDataProvider`: 한국투자증권 접근토큰 발급/캐시, 국내주식 기간별시세와 현재가 조회
 - `MarketRegimeFilter`: 코스피 200일 이동평균선 기반 Risk-On/Risk-Off 판단
 - `TechnicalAnalyzer`: RSI, 20일/60일 이동평균선, 저변동성 기반 기술적 분석
 - `AccumulationAnalyzer`: 네이버 금융 외국인/기관 순매매 기반 수급 매집 분석
