@@ -686,19 +686,37 @@ class KISDataProvider:
         if not self.trading_ready:
             raise RuntimeError("KIS 계좌번호 또는 API 키가 설정되지 않았습니다.")
 
-        payload = self._get(
-            path=self.BUYABLE_ORDER_PATH,
-            tr_id=self._buyable_order_tr_id(),
-            params={
-                "CANO": self.account_no,
-                "ACNT_PRDT_CD": self.account_product_code,
-                "PDNO": code,
-                "ORD_UNPR": str(int(price)),
-                "ORD_DVSN": order_type,
-                "CMA_EVLU_AMT_ICLD_YN": "N",
-                "OVRS_ICLD_YN": "N",
-            },
-        )
+        params = {
+            "CANO": self.account_no,
+            "ACNT_PRDT_CD": self.account_product_code,
+            "PDNO": code,
+            "ORD_UNPR": str(int(price)),
+            "ORD_DVSN": order_type,
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        retry_order_types = [order_type]
+        if self.trading_env == "demo":
+            retry_order_types.extend(order for order in ("00", "01") if order != order_type)
+
+        last_error: Optional[Exception] = None
+        for retry_order_type in retry_order_types:
+            params["ORD_DVSN"] = retry_order_type
+            try:
+                payload = self._get(
+                    path=self.BUYABLE_ORDER_PATH,
+                    tr_id=self._buyable_order_tr_id(),
+                    params=params,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                if retry_order_type != retry_order_types[-1]:
+                    logger.warning("%s 모의 매수가능조회 %s 실패, 다른 주문구분 재조회", code, retry_order_type)
+                    time.sleep(max(REQUEST_DELAY_SECONDS, 0.5))
+        else:
+            raise RuntimeError(f"KIS 매수가능조회 실패: {last_error}") from last_error
+
         output = payload.get("output") or {}
         return output if isinstance(output, dict) else {}
 

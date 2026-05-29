@@ -49,7 +49,12 @@ KIS_ACCOUNT_NO=계좌번호 앞 8자리
 KIS_ACCOUNT_PRODUCT_CODE=01
 ```
 
-모의투자 환경을 쓸 때는 `KIS_BASE_URL`을 한국투자증권 모의투자 도메인으로 바꾸면 됩니다.
+모의투자 환경을 쓸 때는 아래처럼 바꾸면 됩니다.
+
+```text
+KIS_TRADING_ENV=demo
+KIS_BASE_URL=https://openapivts.koreainvestment.com:29443
+```
 
 연결 확인:
 
