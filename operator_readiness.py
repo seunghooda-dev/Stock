@@ -30,6 +30,7 @@ from stock_telegram_bot import (
     data_quality_min_score,
     env_bool,
     env_float,
+    env_int,
     factor_score_minimum,
     format_market_cap,
     investment_thesis_minimum,
@@ -85,6 +86,7 @@ class OperatorReadinessAuditor:
         self._check_local_files()
         self._check_environment()
         self._check_strategy_policy()
+        self._check_news_policy()
         self._check_telegram()
         self._check_kis()
         self._check_market_data()
@@ -259,6 +261,22 @@ class OperatorReadinessAuditor:
             )
         else:
             self._pass("Policy", "Exposure", f"종목당 {max_order_value:,.0f}원, 총 {max_exposure:,.0f}원")
+
+    def _check_news_policy(self) -> None:
+        enabled = env_bool("NEWS_ALERT_ENABLED", True)
+        interval = env_int("NEWS_SCAN_INTERVAL_SECONDS", 300)
+        block_auto_trade = env_bool("NEWS_BLOCK_AUTO_TRADE_ON_RISK", True)
+        if not enabled:
+            self._warn("News", "News radar", "뉴스 속보 감시가 비활성화되어 있습니다.", "NEWS_ALERT_ENABLED=true를 권장합니다.")
+            return
+        if interval > 600:
+            self._warn("News", "News latency", f"뉴스 확인 간격 {interval}초", "속보 반영을 위해 300초 이하를 권장합니다.")
+        else:
+            self._pass("News", "News latency", f"{interval}초 간격")
+        if block_auto_trade:
+            self._pass("News", "Trade guard", "악재 뉴스 감지 시 자동매매 주문 차단")
+        else:
+            self._warn("News", "Trade guard", "뉴스 악재 주문 차단이 꺼져 있습니다.", "NEWS_BLOCK_AUTO_TRADE_ON_RISK=true를 권장합니다.")
 
     def _check_telegram(self) -> None:
         token = os.getenv("TELEGRAM_TOKEN", "").strip()

@@ -275,6 +275,29 @@ REALTIME_MAX_WATCHLIST=50
 - 증거금률 100%로 확인되는 종목은 실시간 알림에서 제외합니다.
 - 장중 거래량이 시간 경과 대비 20일 평균 거래량보다 충분히 빠르지 않으면 알림을 보내지 않습니다.
 
+## 뉴스 속보 레이더
+
+뉴스는 매수 신호가 아니라 악재 회피와 테마 변화 감지용 리스크 레이더로 사용합니다. 기본값은 5분마다 Google News RSS를 확인하고, 시장/테마 키워드와 실시간 후보군 상위 종목명을 함께 감시합니다.
+
+```text
+NEWS_ALERT_ENABLED=true
+NEWS_SCAN_INTERVAL_SECONDS=300
+NEWS_LOOKBACK_MINUTES=90
+NEWS_MAX_STOCK_QUERIES=10
+NEWS_MIN_IMPACT_SCORE=4
+NEWS_BLOCK_AUTO_TRADE_ON_RISK=true
+NEWS_TRADE_BLOCK_LOOKBACK_HOURS=6
+NEWS_TRADE_BLOCK_MIN_SCORE=6
+```
+
+속보 제목에 아래 유형의 키워드가 잡히면 텔레그램으로 즉시 보냅니다.
+
+- 고위험: 거래정지, 상장폐지, 횡령, 배임, 감사의견, 불성실공시, 관리종목
+- 악재: 유상증자, 전환사채, 실적 쇼크, 적자전환, 영업손실, 하한가, 리콜, 소송
+- 호재: 수주, 공급계약, 어닝 서프라이즈, 흑자전환, 자사주, 배당, 목표가 상향
+
+후보 종목에 대해 최근 고위험/악재 뉴스가 감지되면 자동매매 대기 주문은 `NEWS_BLOCK`으로 차단됩니다. RSS 제목 기반 1차 필터이므로 중요한 뉴스는 반드시 원문 기사와 DART/KRX 공시를 확인해야 합니다.
+
 ## 재무 필터
 
 아래 조건을 모두 만족해야 1차 후보가 됩니다.

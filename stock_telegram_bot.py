@@ -3,12 +3,17 @@ import logging
 import os
 import time
 import importlib
+import hashlib
+import xml.etree.ElementTree as ET
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from html import unescape
 from io import StringIO
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import quote_plus
 
 import FinanceDataReader as fdr
 import pandas as pd
@@ -72,6 +77,58 @@ REALTIME_MAX_INTRADAY_RISE_PCT = 15.0
 REALTIME_VI_GUARD_ENABLED = True
 REALTIME_VI_SUSPECT_CHANGE_PCT = 10.0
 REALTIME_BLOCK_MARGIN_RATE = 100.0
+
+# News pulse monitor settings.
+NEWS_ALERT_ENABLED = True
+NEWS_SCAN_INTERVAL_SECONDS = 300
+NEWS_LOOKBACK_MINUTES = 90
+NEWS_ALERT_COOLDOWN_HOURS = 6
+NEWS_MAX_STOCK_QUERIES = 10
+NEWS_MAX_ITEMS_PER_SCAN = 15
+NEWS_MIN_IMPACT_SCORE = 4.0
+NEWS_BLOCK_AUTO_TRADE_ON_RISK = True
+NEWS_TRADE_BLOCK_LOOKBACK_HOURS = 6
+NEWS_TRADE_BLOCK_MIN_SCORE = 6.0
+NEWS_MARKET_QUERIES = [
+    "코스피 코스닥 증시 속보",
+    "한국 증시 환율 금리 속보",
+    "반도체 방산 조선 주식 수주 실적",
+]
+NEWS_HIGH_RISK_KEYWORDS = [
+    "거래정지",
+    "상장폐지",
+    "횡령",
+    "배임",
+    "감사의견",
+    "불성실공시",
+    "관리종목",
+    "압수수색",
+]
+NEWS_NEGATIVE_KEYWORDS = [
+    "유상증자",
+    "전환사채",
+    "실적 쇼크",
+    "적자전환",
+    "영업손실",
+    "하한가",
+    "리콜",
+    "소송",
+    "제재",
+    "과징금",
+    "화재",
+    "급락",
+]
+NEWS_POSITIVE_KEYWORDS = [
+    "수주",
+    "공급계약",
+    "어닝 서프라이즈",
+    "흑자전환",
+    "자사주",
+    "배당",
+    "목표가 상향",
+    "증설",
+    "인수",
+]
 
 # Auto-trading settings. Real orders are blocked unless explicitly enabled in .env.
 AUTO_TRADE_ENABLED = False
@@ -165,6 +222,7 @@ PENDING_TRADE_FILE = CACHE_DIR / "pending_trades.json"
 TRADE_HISTORY_FILE = CACHE_DIR / "trade_history.json"
 REALTIME_CANDIDATE_FILE = CACHE_DIR / "realtime_candidates.json"
 REALTIME_ALERT_FILE = CACHE_DIR / "realtime_alerts.json"
+NEWS_ALERT_FILE = CACHE_DIR / "news_alerts.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -385,6 +443,20 @@ class RealtimeSignal:
     volume_pace_ratio: float
     market_regime: MarketRegime
     summary: str
+
+
+@dataclass
+class NewsImpact:
+    query: str
+    title: str
+    link: str
+    source: str
+    published_at: str
+    sentiment: str
+    impact_score: float
+    matched_terms: List[str] = field(default_factory=list)
+    related_code: str = ""
+    related_name: str = ""
 
 
 @dataclass
@@ -2721,6 +2793,19 @@ class TradingEngine:
         results: List[OrderResult] = []
         history = self._load_trade_history()
         for plan in plans[: max(0, self.max_orders_per_run)]:
+            news_block_reason = recent_news_risk_for_plan(plan)
+            if news_block_reason:
+                results.append(
+                    OrderResult(
+                        plan=plan,
+                        submitted=False,
+                        dry_run=self.dry_run,
+                        status="NEWS_BLOCK",
+                        message=news_block_reason,
+                    )
+                )
+                logger.warning("%s(%s) 뉴스 리스크로 주문 차단: %s", plan.name, plan.code, news_block_reason)
+                continue
             result = self._execute_plan(plan)
             results.append(result)
             if result.submitted and not result.dry_run:
@@ -3209,6 +3294,203 @@ class RealtimeScanner:
             logger.warning("실시간 알림 캐시 저장 실패: %s", exc)
 
 
+class NewsPulseMonitor:
+    GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
+
+    def __init__(self, notifier: Notifier) -> None:
+        load_dotenv()
+        self.notifier = notifier
+        self.enabled = env_bool("NEWS_ALERT_ENABLED", NEWS_ALERT_ENABLED)
+        self.scan_interval_seconds = max(30, env_int("NEWS_SCAN_INTERVAL_SECONDS", NEWS_SCAN_INTERVAL_SECONDS))
+        self.lookback_minutes = env_int("NEWS_LOOKBACK_MINUTES", NEWS_LOOKBACK_MINUTES)
+        self.cooldown_hours = env_float("NEWS_ALERT_COOLDOWN_HOURS", NEWS_ALERT_COOLDOWN_HOURS)
+        self.max_stock_queries = env_int("NEWS_MAX_STOCK_QUERIES", NEWS_MAX_STOCK_QUERIES)
+        self.max_items_per_scan = env_int("NEWS_MAX_ITEMS_PER_SCAN", NEWS_MAX_ITEMS_PER_SCAN)
+        self.min_impact_score = env_float("NEWS_MIN_IMPACT_SCORE", NEWS_MIN_IMPACT_SCORE)
+        self.market_queries = env_list("NEWS_MARKET_QUERIES", NEWS_MARKET_QUERIES)
+        self.high_risk_keywords = env_list("NEWS_HIGH_RISK_KEYWORDS", NEWS_HIGH_RISK_KEYWORDS)
+        self.negative_keywords = env_list("NEWS_NEGATIVE_KEYWORDS", NEWS_NEGATIVE_KEYWORDS)
+        self.positive_keywords = env_list("NEWS_POSITIVE_KEYWORDS", NEWS_POSITIVE_KEYWORDS)
+        self.cache = self._load_cache()
+        self.last_scan_at: Optional[datetime] = None
+
+    def scan_once(self, force: bool = False) -> List[NewsImpact]:
+        if not self.enabled:
+            logger.debug("뉴스 속보 감시 비활성화")
+            return []
+        now = datetime.now()
+        if not force and self.last_scan_at:
+            elapsed = (now - self.last_scan_at).total_seconds()
+            if elapsed < self.scan_interval_seconds:
+                return []
+        self.last_scan_at = now
+
+        impacts: List[NewsImpact] = []
+        for query_meta in self._build_queries():
+            try:
+                impacts.extend(self._fetch_impacts(query_meta))
+            except Exception as exc:
+                logger.debug("뉴스 조회 실패(%s): %s", query_meta["query"], exc)
+            time.sleep(min(REQUEST_DELAY_SECONDS, 0.25))
+            if len(impacts) >= self.max_items_per_scan:
+                break
+
+        fresh_impacts = self._dedupe_and_mark(impacts[: self.max_items_per_scan])
+        self._save_cache(fresh_impacts)
+        if fresh_impacts:
+            self.notifier.send(self._build_news_message(fresh_impacts))
+            logger.info("뉴스 속보 알림 %d건 전송", len(fresh_impacts))
+        else:
+            logger.debug("뉴스 속보 신규 영향 없음")
+        return fresh_impacts
+
+    def _build_queries(self) -> List[Dict[str, str]]:
+        queries = [{"query": query, "code": "", "name": ""} for query in self.market_queries if query.strip()]
+        seen_names = set()
+        for item in self._load_candidate_items()[: max(0, self.max_stock_queries)]:
+            stock = item.get("stock") if isinstance(item, dict) else None
+            if not isinstance(stock, dict):
+                continue
+            name = str(stock.get("name") or stock.get("Name") or "").strip()
+            code = str(stock.get("code") or stock.get("Code") or "").strip()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            queries.append({"query": f"{name} 주식 속보 실적 공시", "code": code, "name": name})
+        return queries
+
+    @staticmethod
+    def _load_candidate_items() -> List[Dict[str, object]]:
+        if not REALTIME_CANDIDATE_FILE.exists():
+            return []
+        try:
+            with REALTIME_CANDIDATE_FILE.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            items = payload.get("candidates", [])
+            return items if isinstance(items, list) else []
+        except Exception:
+            return []
+
+    def _fetch_impacts(self, query_meta: Dict[str, str]) -> List[NewsImpact]:
+        query = query_meta["query"]
+        url = self.GOOGLE_NEWS_URL.format(query=quote_plus(query))
+        response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        impacts: List[NewsImpact] = []
+        cutoff = datetime.now() - timedelta(minutes=max(1, self.lookback_minutes))
+        for item in root.findall(".//item"):
+            title = unescape((item.findtext("title") or "").strip())
+            link = (item.findtext("link") or "").strip()
+            published_at = parse_news_datetime(item.findtext("pubDate") or "")
+            if published_at < cutoff:
+                continue
+            source = (item.findtext("source") or "").strip()
+            sentiment, impact_score, matched_terms = self._score_title(title)
+            if impact_score < self.min_impact_score:
+                continue
+            impacts.append(
+                NewsImpact(
+                    query=query,
+                    title=title,
+                    link=link,
+                    source=source or "Google News",
+                    published_at=published_at.isoformat(timespec="seconds"),
+                    sentiment=sentiment,
+                    impact_score=round(impact_score, 1),
+                    matched_terms=matched_terms,
+                    related_code=query_meta.get("code", ""),
+                    related_name=query_meta.get("name", ""),
+                )
+            )
+        return impacts
+
+    def _score_title(self, title: str) -> tuple[str, float, List[str]]:
+        text = title.lower()
+        high_risk = [term for term in self.high_risk_keywords if term.lower() in text]
+        negative = [term for term in self.negative_keywords if term.lower() in text]
+        positive = [term for term in self.positive_keywords if term.lower() in text]
+        score = len(high_risk) * 4.0 + len(negative) * 2.0 + len(positive) * 2.0
+        if high_risk:
+            sentiment = "risk"
+        elif len(negative) > len(positive):
+            sentiment = "negative"
+        elif positive:
+            sentiment = "positive"
+        else:
+            sentiment = "watch"
+        matched_terms = high_risk + negative + positive
+        return sentiment, score, matched_terms
+
+    def _dedupe_and_mark(self, impacts: List[NewsImpact]) -> List[NewsImpact]:
+        seen = self.cache.setdefault("seen", {})
+        fresh: List[NewsImpact] = []
+        cutoff = datetime.now() - timedelta(hours=max(0.1, self.cooldown_hours))
+        for key, timestamp in list(seen.items()):
+            try:
+                if datetime.fromisoformat(str(timestamp)) < cutoff:
+                    seen.pop(key, None)
+            except ValueError:
+                seen.pop(key, None)
+        for impact in impacts:
+            key = news_cache_key(impact.title, impact.link)
+            if key in seen:
+                continue
+            seen[key] = datetime.now().isoformat(timespec="seconds")
+            fresh.append(impact)
+        return fresh
+
+    def _load_cache(self) -> Dict[str, object]:
+        if not NEWS_ALERT_FILE.exists():
+            return {"seen": {}, "alerts": []}
+        try:
+            with NEWS_ALERT_FILE.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            if not isinstance(payload, dict):
+                return {"seen": {}, "alerts": []}
+            payload.setdefault("seen", {})
+            payload.setdefault("alerts", [])
+            return payload
+        except Exception as exc:
+            logger.warning("뉴스 알림 캐시 로드 실패: %s", exc)
+            return {"seen": {}, "alerts": []}
+
+    def _save_cache(self, impacts: List[NewsImpact]) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            alerts = list(self.cache.get("alerts") or [])
+            alerts.extend(asdict(impact) for impact in impacts)
+            self.cache["alerts"] = alerts[-300:]
+            with NEWS_ALERT_FILE.open("w", encoding="utf-8") as file:
+                json.dump(self.cache, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("뉴스 알림 캐시 저장 실패: %s", exc)
+
+    @staticmethod
+    def _build_news_message(impacts: List[NewsImpact]) -> str:
+        lines = [
+            "📰 뉴스 속보 리스크 레이더",
+            f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"감지 {len(impacts)}건",
+        ]
+        for impact in impacts:
+            icon = {"risk": "🚨", "negative": "⚠️", "positive": "✅"}.get(impact.sentiment, "🧐")
+            related = f"{impact.related_name}({impact.related_code})" if impact.related_name else "시장/테마"
+            terms = ", ".join(impact.matched_terms[:5]) or "키워드 없음"
+            lines.extend(
+                [
+                    "",
+                    f"{icon} {related} / {impact.sentiment.upper()} / 영향 {impact.impact_score:.1f}",
+                    f"{impact.title}",
+                    f"출처: {impact.source}, 시간: {impact.published_at}",
+                    f"감지어: {terms}",
+                    impact.link,
+                ]
+            )
+        lines.extend(["", "※ 속보 감지는 RSS 제목 기반 1차 필터입니다. 주문 전 원문과 공시를 확인하세요."])
+        return "\n".join(lines)
+
+
 class FinancialHealthBot:
     def __init__(self) -> None:
         load_dotenv()
@@ -3225,6 +3507,7 @@ class FinancialHealthBot:
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
         self.realtime_scanner = RealtimeScanner(self.kis_provider, self.notifier)
+        self.news_monitor = NewsPulseMonitor(self.notifier)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
 
     def run_once(self) -> None:
@@ -3274,6 +3557,13 @@ class FinancialHealthBot:
         except Exception as exc:
             logger.exception("실시간 스캔 실패: %s", exc)
             self.notifier.send(f"⚠️ 실시간 스캔 오류\n{exc}")
+
+    def run_news_once(self, force: bool = False) -> None:
+        try:
+            self.news_monitor.scan_once(force=force)
+        except Exception as exc:
+            logger.exception("뉴스 속보 감시 실패: %s", exc)
+            self.notifier.send(f"⚠️ 뉴스 속보 감시 오류\n{exc}")
 
     def run_trading_once(self) -> None:
         logger.info("자동매매 대기 주문 실행 시작")
@@ -3772,6 +4062,19 @@ def env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def env_list(name: str, default: List[str]) -> List[str]:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return list(default)
+    separators = ["|", "\n", ";"]
+    parts = [value]
+    for separator in separators:
+        if separator in value:
+            parts = value.split(separator)
+            break
+    return [part.strip() for part in parts if part.strip()]
+
+
 def active_strategy_profile() -> str:
     profile = os.getenv("STRATEGY_PROFILE", STRATEGY_PROFILE).strip().lower()
     if profile not in {"conservative", "institutional", "balanced", "aggressive"}:
@@ -3925,6 +4228,54 @@ def max_drawdown(close: pd.Series) -> float:
     return abs(float(drawdown.min() * 100))
 
 
+def parse_news_datetime(value: str) -> datetime:
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is not None:
+            return parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        return datetime.now()
+
+
+def news_cache_key(title: str, link: str) -> str:
+    raw = f"{title}|{link}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def recent_news_risk_for_plan(plan: OrderPlan) -> str:
+    if not env_bool("NEWS_BLOCK_AUTO_TRADE_ON_RISK", NEWS_BLOCK_AUTO_TRADE_ON_RISK):
+        return ""
+    if not NEWS_ALERT_FILE.exists():
+        return ""
+    try:
+        with NEWS_ALERT_FILE.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+        alerts = payload.get("alerts", []) if isinstance(payload, dict) else []
+        cutoff = datetime.now() - timedelta(hours=max(0.1, env_float("NEWS_TRADE_BLOCK_LOOKBACK_HOURS", NEWS_TRADE_BLOCK_LOOKBACK_HOURS)))
+        min_score = env_float("NEWS_TRADE_BLOCK_MIN_SCORE", NEWS_TRADE_BLOCK_MIN_SCORE)
+        for item in reversed(alerts):
+            if not isinstance(item, dict):
+                continue
+            sentiment = str(item.get("sentiment", ""))
+            if sentiment not in {"risk", "negative"}:
+                continue
+            impact_score = to_float(item.get("impact_score")) or 0.0
+            if impact_score < min_score:
+                continue
+            published_at = datetime.fromisoformat(str(item.get("published_at")))
+            if published_at < cutoff:
+                continue
+            title = str(item.get("title", ""))
+            related_code = str(item.get("related_code", ""))
+            related_name = str(item.get("related_name", ""))
+            if related_code == plan.code or plan.name in title or (related_name and related_name == plan.name):
+                return f"최근 뉴스 리스크 감지: {title[:120]} (영향 {impact_score:.1f})"
+    except Exception as exc:
+        logger.warning("뉴스 리스크 주문 차단 확인 실패: %s", exc)
+    return ""
+
+
 def run_scheduled_job(bot: FinancialHealthBot) -> None:
     bot.run_once()
 
@@ -3935,6 +4286,10 @@ def run_candidate_job(bot: FinancialHealthBot) -> None:
 
 def run_realtime_job(bot: FinancialHealthBot) -> None:
     bot.run_realtime_once()
+
+
+def run_news_job(bot: FinancialHealthBot) -> None:
+    bot.run_news_once()
 
 
 def run_trading_job(bot: FinancialHealthBot) -> None:
@@ -3953,12 +4308,19 @@ def main() -> None:
         bot.realtime_scanner.scan_interval_seconds,
     )
     logger.info("자동매매 대기 주문은 매일 한국 시간 기준 %s에 실행합니다.", bot.trading_engine.run_time)
+    logger.info(
+        "뉴스 속보 감시는 %s, %d초 간격으로 실행합니다.",
+        "활성화" if bot.news_monitor.enabled else "비활성화",
+        bot.news_monitor.scan_interval_seconds,
+    )
 
     schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
     schedule.every().day.at(bot.realtime_scanner.candidate_run_time).do(run_candidate_job, bot)
     schedule.every(bot.realtime_scanner.scan_interval_seconds).seconds.do(run_realtime_job, bot)
+    schedule.every(bot.news_monitor.scan_interval_seconds).seconds.do(run_news_job, bot)
     schedule.every().day.at(bot.trading_engine.run_time).do(run_trading_job, bot)
     run_scheduled_job(bot)
+    run_news_job(bot)
 
     while True:
         try:
