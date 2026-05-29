@@ -27,6 +27,9 @@ CHAT_ID = ""
 KIS_APP_KEY = ""
 KIS_APP_SECRET = ""
 KIS_BASE_URL = "https://openapi.koreainvestment.com:9443"
+KIS_ACCOUNT_NO = ""
+KIS_ACCOUNT_PRODUCT_CODE = "01"
+KIS_TRADING_ENV = "real"
 
 # Scanner settings
 RUN_TIME_KST = "16:00"
@@ -38,6 +41,21 @@ FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
 IMMEDIATE_ALERTS_ENABLED = True
 IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
+
+# Auto-trading settings. Real orders are blocked unless explicitly enabled in .env.
+AUTO_TRADE_ENABLED = False
+AUTO_TRADE_DRY_RUN = True
+AUTO_TRADE_CONFIRM_REAL_TRADING = "NO"
+AUTO_TRADE_RUN_TIME_KST = "09:05"
+AUTO_TRADE_MAX_ORDERS_PER_RUN = 2
+AUTO_TRADE_ORDER_BUDGET_KRW = 300_000
+AUTO_TRADE_MAX_ORDER_VALUE_KRW = 500_000
+AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW = 1_000_000
+AUTO_TRADE_COOLDOWN_HOURS = 20
+AUTO_TRADE_PENDING_MAX_AGE_HOURS = 20
+AUTO_TRADE_ORDER_TYPE = "00"  # 00: limit, 01: market
+AUTO_TRADE_EXCHANGE = "KRX"
+AUTO_TRADE_USE_HASHKEY = True
 
 # Liquidity guardrails
 MIN_MARKET_CAP = 50_000_000_000
@@ -80,6 +98,8 @@ CACHE_DIR = Path("cache")
 FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
 ALERT_CACHE_FILE = CACHE_DIR / "alerts.json"
 KIS_TOKEN_CACHE_FILE = CACHE_DIR / "kis_token.json"
+PENDING_TRADE_FILE = CACHE_DIR / "pending_trades.json"
+TRADE_HISTORY_FILE = CACHE_DIR / "trade_history.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,6 +174,31 @@ class DiscoveryReport:
     technicals: TechnicalSnapshot
     accumulation: Optional[AccumulationSnapshot]
     reason: str
+
+
+@dataclass
+class OrderPlan:
+    side: str
+    code: str
+    name: str
+    quantity: int
+    estimated_price: float
+    estimated_value: float
+    stop_loss: float
+    order_type: str
+    exchange: str
+    reason: str
+    created_at: str
+
+
+@dataclass
+class OrderResult:
+    plan: OrderPlan
+    submitted: bool
+    dry_run: bool
+    status: str
+    message: str
+    order_number: Optional[str] = None
 
 
 class FinancialScanner:
@@ -456,19 +501,30 @@ class MarketRegimeFilter:
 
 class KISDataProvider:
     TOKEN_PATH = "/oauth2/tokenP"
+    HASHKEY_PATH = "/uapi/hashkey"
     DAILY_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
     CURRENT_PRICE_PATH = "/uapi/domestic-stock/v1/quotations/inquire-price"
+    ORDER_CASH_PATH = "/uapi/domestic-stock/v1/trading/order-cash"
+    BUYABLE_ORDER_PATH = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
 
     def __init__(self) -> None:
         load_dotenv()
         self.app_key = KIS_APP_KEY or os.getenv("KIS_APP_KEY", "")
         self.app_secret = KIS_APP_SECRET or os.getenv("KIS_APP_SECRET", "")
         self.base_url = os.getenv("KIS_BASE_URL", KIS_BASE_URL).rstrip("/")
+        self.trading_env = normalize_trading_env(os.getenv("KIS_TRADING_ENV", KIS_TRADING_ENV))
+        account_no = KIS_ACCOUNT_NO or os.getenv("KIS_ACCOUNT_NO", "")
+        account_product_code = KIS_ACCOUNT_PRODUCT_CODE or os.getenv("KIS_ACCOUNT_PRODUCT_CODE", "01")
+        self.account_no, self.account_product_code = normalize_kis_account(account_no, account_product_code)
         self.session = requests.Session()
 
     @property
     def enabled(self) -> bool:
         return bool(self.app_key and self.app_secret)
+
+    @property
+    def trading_ready(self) -> bool:
+        return bool(self.enabled and self.account_no and self.account_product_code)
 
     def fetch_daily_price(self, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         if not self.enabled:
@@ -530,25 +586,133 @@ class KISDataProvider:
             "trading_value": to_float(output.get("acml_tr_pbmn")),
         }
 
+    def fetch_buyable_order(self, code: str, price: float, order_type: str = "01") -> Dict[str, object]:
+        if not self.trading_ready:
+            raise RuntimeError("KIS 계좌번호 또는 API 키가 설정되지 않았습니다.")
+
+        payload = self._get(
+            path=self.BUYABLE_ORDER_PATH,
+            tr_id=self._buyable_order_tr_id(),
+            params={
+                "CANO": self.account_no,
+                "ACNT_PRDT_CD": self.account_product_code,
+                "PDNO": code,
+                "ORD_UNPR": str(int(price)),
+                "ORD_DVSN": order_type,
+                "CMA_EVLU_AMT_ICLD_YN": "N",
+                "OVRS_ICLD_YN": "N",
+            },
+        )
+        output = payload.get("output") or {}
+        return output if isinstance(output, dict) else {}
+
+    def place_cash_order(
+        self,
+        side: str,
+        code: str,
+        quantity: int,
+        price: float,
+        order_type: str = "01",
+        exchange: str = "KRX",
+        use_hashkey: bool = True,
+    ) -> Dict[str, object]:
+        if not self.trading_ready:
+            raise RuntimeError("KIS 계좌번호 또는 API 키가 설정되지 않았습니다.")
+        if side not in {"buy", "sell"}:
+            raise ValueError("side는 buy 또는 sell이어야 합니다.")
+        if quantity <= 0:
+            raise ValueError("주문 수량은 1주 이상이어야 합니다.")
+
+        order_price = 0 if order_type == "01" else int(price)
+        body = {
+            "CANO": self.account_no,
+            "ACNT_PRDT_CD": self.account_product_code,
+            "PDNO": code,
+            "ORD_DVSN": order_type,
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": str(order_price),
+            "EXCG_ID_DVSN_CD": exchange,
+            "SLL_TYPE": "01" if side == "sell" else "",
+            "CNDT_PRIC": "",
+        }
+        return self._post(
+            path=self.ORDER_CASH_PATH,
+            tr_id=self._cash_order_tr_id(side),
+            body=body,
+            include_hashkey=use_hashkey,
+        )
+
     def _get(self, path: str, tr_id: str, params: Dict[str, str]) -> Dict[str, object]:
         token = self._get_access_token()
         response = self.session.get(
             f"{self.base_url}{path}",
-            headers={
-                "authorization": f"Bearer {token}",
-                "appkey": self.app_key,
-                "appsecret": self.app_secret,
-                "tr_id": tr_id,
-                "custtype": "P",
-            },
+            headers=self._build_headers(token=token, tr_id=tr_id),
             params=params,
             timeout=20,
         )
         response.raise_for_status()
+        return self._validate_payload(response.json())
+
+    def _post(
+        self,
+        path: str,
+        tr_id: str,
+        body: Dict[str, str],
+        include_hashkey: bool = False,
+    ) -> Dict[str, object]:
+        token = self._get_access_token()
+        headers = self._build_headers(token=token, tr_id=tr_id)
+        if include_hashkey:
+            headers["hashkey"] = self._create_hashkey(token, body)
+
+        response = self.session.post(
+            f"{self.base_url}{path}",
+            headers=headers,
+            json=body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        return self._validate_payload(response.json())
+
+    def _create_hashkey(self, token: str, body: Dict[str, str]) -> str:
+        response = self.session.post(
+            f"{self.base_url}{self.HASHKEY_PATH}",
+            headers=self._build_headers(token=token, tr_id=""),
+            json=body,
+            timeout=20,
+        )
+        response.raise_for_status()
         payload = response.json()
+        hashkey = payload.get("HASH")
+        if not hashkey:
+            raise RuntimeError(f"KIS hashkey 발급 실패: {payload}")
+        return str(hashkey)
+
+    def _build_headers(self, token: str, tr_id: str) -> Dict[str, str]:
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {token}",
+            "appkey": self.app_key,
+            "appsecret": self.app_secret,
+            "custtype": "P",
+        }
+        if tr_id:
+            headers["tr_id"] = tr_id
+        return headers
+
+    @staticmethod
+    def _validate_payload(payload: Dict[str, object]) -> Dict[str, object]:
         if str(payload.get("rt_cd", "0")) != "0":
             raise RuntimeError(f"KIS API 오류 {payload.get('msg_cd')}: {payload.get('msg1')}")
         return payload
+
+    def _cash_order_tr_id(self, side: str) -> str:
+        if self.trading_env == "real":
+            return "TTTC0012U" if side == "buy" else "TTTC0011U"
+        return "VTTC0012U" if side == "buy" else "VTTC0011U"
+
+    def _buyable_order_tr_id(self) -> str:
+        return "TTTC8908R" if self.trading_env == "real" else "VTTC8908R"
 
     def _get_access_token(self) -> str:
         cached_token = self._load_cached_token()
@@ -882,6 +1046,284 @@ class Notifier:
         return chunks
 
 
+class TradingEngine:
+    def __init__(self, kis_provider: KISDataProvider, notifier: Notifier) -> None:
+        load_dotenv()
+        self.kis_provider = kis_provider
+        self.notifier = notifier
+        self.enabled = env_bool("AUTO_TRADE_ENABLED", AUTO_TRADE_ENABLED)
+        self.dry_run = env_bool("AUTO_TRADE_DRY_RUN", AUTO_TRADE_DRY_RUN)
+        self.confirm_real_trading = os.getenv(
+            "AUTO_TRADE_CONFIRM_REAL_TRADING",
+            AUTO_TRADE_CONFIRM_REAL_TRADING,
+        ).strip()
+        self.run_time = os.getenv("AUTO_TRADE_RUN_TIME_KST", AUTO_TRADE_RUN_TIME_KST)
+        self.max_orders_per_run = env_int("AUTO_TRADE_MAX_ORDERS_PER_RUN", AUTO_TRADE_MAX_ORDERS_PER_RUN)
+        self.order_budget_krw = env_float("AUTO_TRADE_ORDER_BUDGET_KRW", AUTO_TRADE_ORDER_BUDGET_KRW)
+        self.max_order_value_krw = env_float("AUTO_TRADE_MAX_ORDER_VALUE_KRW", AUTO_TRADE_MAX_ORDER_VALUE_KRW)
+        self.max_portfolio_exposure_krw = env_float(
+            "AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW",
+            AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW,
+        )
+        self.cooldown_hours = env_float("AUTO_TRADE_COOLDOWN_HOURS", AUTO_TRADE_COOLDOWN_HOURS)
+        self.pending_max_age_hours = env_float(
+            "AUTO_TRADE_PENDING_MAX_AGE_HOURS",
+            AUTO_TRADE_PENDING_MAX_AGE_HOURS,
+        )
+        self.order_type = os.getenv("AUTO_TRADE_ORDER_TYPE", AUTO_TRADE_ORDER_TYPE).strip() or "01"
+        self.exchange = os.getenv("AUTO_TRADE_EXCHANGE", AUTO_TRADE_EXCHANGE).strip() or "KRX"
+        self.use_hashkey = env_bool("AUTO_TRADE_USE_HASHKEY", AUTO_TRADE_USE_HASHKEY)
+
+    def prepare_buy_plans(self, reports: List[DiscoveryReport], market_regime: MarketRegime) -> List[OrderPlan]:
+        if not market_regime.risk_on or not reports:
+            return []
+
+        history = self._load_trade_history()
+        plans: List[OrderPlan] = []
+        planned_value = 0.0
+
+        for report in reports:
+            if len(plans) >= max(0, self.max_orders_per_run):
+                break
+            if self._recently_traded(report.stock.code, history):
+                logger.info("%s(%s) 최근 자동매매 이력으로 주문 후보 제외", report.stock.name, report.stock.code)
+                continue
+
+            current_price = report.technicals.current_price
+            if current_price <= 0:
+                continue
+
+            remaining_exposure = max(0.0, self.max_portfolio_exposure_krw - planned_value)
+            budget = min(self.order_budget_krw, self.max_order_value_krw, remaining_exposure)
+            quantity = int(budget // current_price)
+            if quantity < 1:
+                logger.info("%s(%s) 주문 예산 부족으로 자동매매 후보 제외", report.stock.name, report.stock.code)
+                continue
+
+            estimated_value = quantity * current_price
+            plans.append(
+                OrderPlan(
+                    side="buy",
+                    code=report.stock.code,
+                    name=report.stock.name,
+                    quantity=quantity,
+                    estimated_price=current_price,
+                    estimated_value=estimated_value,
+                    stop_loss=report.technicals.stop_loss,
+                    order_type=self.order_type,
+                    exchange=self.exchange,
+                    reason=report.reason,
+                    created_at=datetime.now().isoformat(timespec="seconds"),
+                )
+            )
+            planned_value += estimated_value
+
+        return plans
+
+    def save_pending_plans(self, plans: List[OrderPlan]) -> None:
+        if not self.enabled or not plans:
+            return
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            payload = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "trading_env": self.kis_provider.trading_env,
+                "dry_run": self.dry_run,
+                "plans": [asdict(plan) for plan in plans],
+            }
+            with PENDING_TRADE_FILE.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+            logger.info("자동매매 대기 주문 %d건 저장", len(plans))
+        except Exception as exc:
+            logger.warning("자동매매 대기 주문 저장 실패: %s", exc)
+
+    def execute_pending_orders(self) -> List[OrderResult]:
+        plans = self._load_pending_plans()
+        if not plans:
+            logger.info("자동매매 대기 주문이 없습니다.")
+            return []
+        if not self.enabled:
+            logger.info("AUTO_TRADE_ENABLED=false 이므로 주문 실행을 건너뜁니다.")
+            return []
+
+        permitted, reason = self._orders_permitted()
+        if not permitted:
+            message = f"🤖 자동매매 실행 차단\n{reason}"
+            logger.warning(message)
+            self.notifier.send(message)
+            return []
+
+        results: List[OrderResult] = []
+        history = self._load_trade_history()
+        for plan in plans[: max(0, self.max_orders_per_run)]:
+            result = self._execute_plan(plan)
+            results.append(result)
+            if result.submitted and not result.dry_run:
+                history[plan.code] = datetime.now().isoformat(timespec="seconds")
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+        self._save_trade_history(history)
+        self._clear_pending_plans()
+        if results:
+            self.notifier.send(self._build_execution_message(results))
+        return results
+
+    def discard_pending_plans(self, reason: str) -> None:
+        plans = self._load_pending_plans()
+        if not plans:
+            return
+        self._clear_pending_plans()
+        message = f"🤖 자동매매 대기 주문 폐기\n{reason}\n폐기 건수: {len(plans)}"
+        logger.warning(message)
+        self.notifier.send(message)
+
+    def status_summary(self) -> str:
+        if not self.enabled:
+            return "자동매매 비활성화(AUTO_TRADE_ENABLED=false)"
+        mode = "DRY_RUN" if self.dry_run else "실주문"
+        account = mask_account(self.kis_provider.account_no, self.kis_provider.account_product_code)
+        return (
+            f"{mode}, {self.kis_provider.trading_env}, 계좌 {account}, "
+            f"주문시간 {self.run_time}, 1회 최대 {self.max_orders_per_run}건"
+        )
+
+    def _execute_plan(self, plan: OrderPlan) -> OrderResult:
+        if self.dry_run:
+            return OrderResult(
+                plan=plan,
+                submitted=True,
+                dry_run=True,
+                status="DRY_RUN",
+                message="실제 주문은 전송하지 않고 주문 가능성만 기록했습니다.",
+            )
+
+        try:
+            buyable = self.kis_provider.fetch_buyable_order(plan.code, plan.estimated_price, plan.order_type)
+            buyable_cash = to_float(buyable.get("nrcvb_buy_amt"))
+            buyable_qty = to_float(buyable.get("nrcvb_buy_qty"))
+            if buyable_cash is not None and plan.estimated_value > buyable_cash:
+                raise RuntimeError(
+                    f"매수가능금액 부족: 필요 {plan.estimated_value:,.0f}원, 가능 {buyable_cash:,.0f}원"
+                )
+            if buyable_qty is not None and plan.quantity > int(buyable_qty):
+                raise RuntimeError(f"매수가능수량 부족: 필요 {plan.quantity}주, 가능 {int(buyable_qty)}주")
+
+            payload = self.kis_provider.place_cash_order(
+                side=plan.side,
+                code=plan.code,
+                quantity=plan.quantity,
+                price=plan.estimated_price,
+                order_type=plan.order_type,
+                exchange=plan.exchange,
+                use_hashkey=self.use_hashkey,
+            )
+            output = payload.get("output") or {}
+            order_number = None
+            if isinstance(output, dict):
+                order_number = str(output.get("ODNO") or "") or None
+            return OrderResult(
+                plan=plan,
+                submitted=True,
+                dry_run=False,
+                status="SUBMITTED",
+                message=str(payload.get("msg1", "주문 접수")),
+                order_number=order_number,
+            )
+        except Exception as exc:
+            logger.exception("%s(%s) 자동매매 주문 실패: %s", plan.name, plan.code, exc)
+            return OrderResult(
+                plan=plan,
+                submitted=False,
+                dry_run=False,
+                status="ERROR",
+                message=str(exc),
+            )
+
+    def _orders_permitted(self) -> tuple[bool, str]:
+        if self.dry_run:
+            return True, ""
+        if not self.kis_provider.trading_ready:
+            return False, "KIS_APP_KEY, KIS_APP_SECRET, KIS_ACCOUNT_NO, KIS_ACCOUNT_PRODUCT_CODE 설정이 필요합니다."
+        if self.kis_provider.trading_env == "real" and self.confirm_real_trading != "YES":
+            return False, "실전 주문은 AUTO_TRADE_CONFIRM_REAL_TRADING=YES 설정 전까지 차단됩니다."
+        return True, ""
+
+    @staticmethod
+    def _build_execution_message(results: List[OrderResult]) -> str:
+        lines = ["🤖 자동매매 주문 실행 결과"]
+        for result in results:
+            plan = result.plan
+            order_no = f", 주문번호 {result.order_number}" if result.order_number else ""
+            lines.extend(
+                [
+                    "",
+                    f"[{plan.name}({plan.code})] {result.status}{order_no}",
+                    f"수량 {plan.quantity}주, 예상금액 {plan.estimated_value:,.0f}원",
+                    f"손절 기준 {plan.stop_loss:,.0f}원",
+                    result.message,
+                ]
+            )
+        return "\n".join(lines)
+
+    def _load_pending_plans(self) -> List[OrderPlan]:
+        if not PENDING_TRADE_FILE.exists():
+            return []
+        try:
+            with PENDING_TRADE_FILE.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            created_at_text = payload.get("created_at")
+            if created_at_text and self.pending_max_age_hours > 0:
+                created_at = datetime.fromisoformat(str(created_at_text))
+                if datetime.now() - created_at > timedelta(hours=self.pending_max_age_hours):
+                    logger.warning("자동매매 대기 주문이 만료되어 폐기합니다.")
+                    self._clear_pending_plans()
+                    return []
+            plans = payload.get("plans", [])
+            return [OrderPlan(**plan) for plan in plans if isinstance(plan, dict)]
+        except Exception as exc:
+            logger.warning("자동매매 대기 주문 로드 실패: %s", exc)
+            return []
+
+    @staticmethod
+    def _clear_pending_plans() -> None:
+        try:
+            if PENDING_TRADE_FILE.exists():
+                PENDING_TRADE_FILE.unlink()
+        except Exception as exc:
+            logger.warning("자동매매 대기 주문 삭제 실패: %s", exc)
+
+    @staticmethod
+    def _load_trade_history() -> Dict[str, str]:
+        if not TRADE_HISTORY_FILE.exists():
+            return {}
+        try:
+            with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+            return {str(code): str(timestamp) for code, timestamp in data.items()}
+        except Exception as exc:
+            logger.warning("자동매매 이력 로드 실패: %s", exc)
+            return {}
+
+    @staticmethod
+    def _save_trade_history(history: Dict[str, str]) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with TRADE_HISTORY_FILE.open("w", encoding="utf-8") as file:
+                json.dump(history, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("자동매매 이력 저장 실패: %s", exc)
+
+    def _recently_traded(self, code: str, history: Dict[str, str]) -> bool:
+        traded_at_text = history.get(code)
+        if not traded_at_text:
+            return False
+        try:
+            traded_at = datetime.fromisoformat(traded_at_text)
+        except ValueError:
+            return False
+        return datetime.now() - traded_at < timedelta(hours=self.cooldown_hours)
+
+
 class FinancialHealthBot:
     def __init__(self) -> None:
         load_dotenv()
@@ -893,6 +1335,7 @@ class FinancialHealthBot:
         self.technical_analyzer = TechnicalAnalyzer(self.kis_provider)
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.notifier = Notifier(token=token, chat_id=chat_id)
+        self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
 
     def run_once(self) -> None:
@@ -936,12 +1379,35 @@ class FinancialHealthBot:
                     self._send_immediate_alert_if_needed(latest_report, market_regime)
 
             reports = self._rank_reports(reports)[:MAX_REPORTS]
-            self.notifier.send(self._build_message(reports, market_regime))
+            order_plans = self.trading_engine.prepare_buy_plans(reports, market_regime)
+            self.trading_engine.save_pending_plans(order_plans)
+            self.notifier.send(
+                self._build_message(
+                    reports=reports,
+                    market_regime=market_regime,
+                    order_plans=order_plans,
+                    trading_status=self.trading_engine.status_summary(),
+                )
+            )
             self._save_alert_cache()
             logger.info("재무 건전성 종목 발굴 작업 완료. 최종 후보: %d개", len(reports))
         except Exception as exc:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
             self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
+
+    def run_trading_once(self) -> None:
+        logger.info("자동매매 대기 주문 실행 시작")
+        try:
+            market_regime = self.market_regime_filter.analyze()
+            if not market_regime.risk_on:
+                self.trading_engine.discard_pending_plans(
+                    f"시장 국면이 Risk-Off입니다. {market_regime.summary}"
+                )
+                return
+            self.trading_engine.execute_pending_orders()
+        except Exception as exc:
+            logger.exception("자동매매 대기 주문 실행 실패: %s", exc)
+            self.notifier.send(f"⚠️ 자동매매 실행 오류\n{exc}")
 
     def _send_immediate_alert_if_needed(self, report: DiscoveryReport, market_regime: MarketRegime) -> None:
         cache_key = report.stock.code
@@ -1025,7 +1491,12 @@ class FinancialHealthBot:
         )
 
     @staticmethod
-    def _build_message(reports: List[DiscoveryReport], market_regime: MarketRegime) -> str:
+    def _build_message(
+        reports: List[DiscoveryReport],
+        market_regime: MarketRegime,
+        order_plans: Optional[List[OrderPlan]] = None,
+        trading_status: str = "",
+    ) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
         if not reports:
             return (
@@ -1081,6 +1552,19 @@ class FinancialHealthBot:
                 ]
             )
 
+        if order_plans:
+            lines.extend(
+                [
+                    "",
+                    "🤖 자동매매 주문 계획",
+                    f"상태: {trading_status or 'N/A'}",
+                ]
+            )
+            for plan in order_plans:
+                lines.append(format_order_plan(plan))
+        elif trading_status:
+            lines.extend(["", f"🤖 자동매매 상태: {trading_status}"])
+
         lines.extend(
             [
                 "",
@@ -1123,6 +1607,67 @@ def format_accumulation(value: Optional[AccumulationSnapshot]) -> str:
     )
 
 
+def format_order_plan(plan: OrderPlan) -> str:
+    order_type = "시장가" if plan.order_type == "01" else "지정가"
+    return (
+        f"- [{plan.name}({plan.code})] {order_type} {plan.quantity}주, "
+        f"예상 {plan.estimated_value:,.0f}원, 손절 {plan.stop_loss:,.0f}원"
+    )
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return int(float(value.replace(",", "")))
+    except ValueError:
+        logger.warning("%s=%s 값을 정수로 해석할 수 없어 기본값 %s 사용", name, value, default)
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return float(default)
+    try:
+        return float(value.replace(",", ""))
+    except ValueError:
+        logger.warning("%s=%s 값을 숫자로 해석할 수 없어 기본값 %s 사용", name, value, default)
+        return float(default)
+
+
+def normalize_trading_env(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {"real", "prod", "production", "live"}:
+        return "real"
+    return "demo"
+
+
+def normalize_kis_account(account_no: str, account_product_code: str) -> tuple[str, str]:
+    digits = "".join(ch for ch in str(account_no) if ch.isdigit())
+    product_digits = "".join(ch for ch in str(account_product_code) if ch.isdigit())
+    if len(digits) == 10 and not product_digits:
+        return digits[:8], digits[8:]
+    if len(digits) == 10 and product_digits == "01":
+        return digits[:8], digits[8:]
+    return digits[:8] if len(digits) >= 8 else digits, (product_digits or "01")[:2]
+
+
+def mask_account(account_no: str, product_code: str) -> str:
+    if not account_no:
+        return "미설정"
+    visible = account_no[-2:] if len(account_no) >= 2 else account_no
+    return f"******{visible}-{product_code or '**'}"
+
+
 def compact_date(value: str) -> str:
     return value.replace("-", "")
 
@@ -1150,12 +1695,18 @@ def run_scheduled_job(bot: FinancialHealthBot) -> None:
     bot.run_once()
 
 
+def run_trading_job(bot: FinancialHealthBot) -> None:
+    bot.run_trading_once()
+
+
 def main() -> None:
     bot = FinancialHealthBot()
     logger.info("재무 건전성 중심 종목 발굴 봇 시작")
     logger.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
+    logger.info("자동매매 대기 주문은 매일 한국 시간 기준 %s에 실행합니다.", bot.trading_engine.run_time)
 
     schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
+    schedule.every().day.at(bot.trading_engine.run_time).do(run_trading_job, bot)
     run_scheduled_job(bot)
 
     while True:

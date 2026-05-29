@@ -44,6 +44,9 @@ KIS Developers에서 API 신청 후 발급받은 `APP_KEY`, `APP_SECRET`을 `.en
 KIS_APP_KEY=한국투자증권 APP KEY
 KIS_APP_SECRET=한국투자증권 APP SECRET
 KIS_BASE_URL=https://openapi.koreainvestment.com:9443
+KIS_TRADING_ENV=real
+KIS_ACCOUNT_NO=계좌번호 앞 8자리
+KIS_ACCOUNT_PRODUCT_CODE=01
 ```
 
 모의투자 환경을 쓸 때는 `KIS_BASE_URL`을 한국투자증권 모의투자 도메인으로 바꾸면 됩니다.
@@ -53,6 +56,36 @@ KIS_BASE_URL=https://openapi.koreainvestment.com:9443
 ```powershell
 .\.venv\Scripts\python.exe test_kis_connection.py
 ```
+
+## 자동매매 설계
+
+스캐너는 오후 4시에 종목을 발굴한 뒤, 매수 주문 계획을 `cache/pending_trades.json`에 저장할 수 있습니다. 실제 주문 실행은 다음 거래일 오전 9시 5분 스케줄에서 처리합니다. 기본값은 안전을 위해 자동매매 비활성화와 모의 실행입니다.
+
+```text
+AUTO_TRADE_ENABLED=false
+AUTO_TRADE_DRY_RUN=true
+AUTO_TRADE_RUN_TIME_KST=09:05
+AUTO_TRADE_MAX_ORDERS_PER_RUN=2
+AUTO_TRADE_ORDER_TYPE=00
+AUTO_TRADE_ORDER_BUDGET_KRW=300000
+AUTO_TRADE_MAX_ORDER_VALUE_KRW=500000
+AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW=1000000
+AUTO_TRADE_PENDING_MAX_AGE_HOURS=20
+```
+
+실제 주문을 보내려면 아래 값을 모두 의도적으로 바꿔야 합니다.
+
+```text
+AUTO_TRADE_ENABLED=true
+AUTO_TRADE_DRY_RUN=false
+KIS_TRADING_ENV=real
+KIS_BASE_URL=https://openapi.koreainvestment.com:9443
+AUTO_TRADE_CONFIRM_REAL_TRADING=YES
+```
+
+모의투자 주문을 먼저 검증하려면 `KIS_TRADING_ENV=demo`, 모의투자용 `APP_KEY/APP_SECRET`, 모의투자 계좌번호, 모의투자 도메인을 사용하세요.
+
+`AUTO_TRADE_ORDER_TYPE=00`은 지정가, `01`은 시장가입니다. 기본값은 시가 급등 시 과도한 체결가를 피하기 위해 지정가입니다.
 
 ## 실행
 
@@ -100,6 +133,9 @@ KIS_BASE_URL=https://openapi.koreainvestment.com:9443
 - ATR(14)을 계산합니다.
 - 손절선은 `현재가 - 2 * ATR`로 표시합니다.
 - 유동성이 낮은 종목은 호가 공백과 체결 리스크가 크기 때문에 사전에 제외합니다.
+- 자동매매는 1회 주문 수, 종목당 예산, 1회 총 노출 한도, 동일 종목 재진입 쿨다운을 적용합니다.
+- 주문 실행 직전에도 시장 국면을 재확인하고, Risk-Off면 대기 주문을 폐기합니다.
+- 실전 주문은 `AUTO_TRADE_CONFIRM_REAL_TRADING=YES`가 없으면 코드상에서 차단됩니다.
 
 ## 수급 매집 필터
 
@@ -114,6 +150,7 @@ KIS_BASE_URL=https://openapi.koreainvestment.com:9443
 
 - `FinancialScanner`: 전종목 유니버스 구성, yfinance 재무제표 수집, 재무 필터링
 - `KISDataProvider`: 한국투자증권 접근토큰 발급/캐시, 국내주식 기간별시세와 현재가 조회
+- `TradingEngine`: 종목 발굴 결과를 주문 계획으로 변환하고 KIS 현금 주문을 실행
 - `MarketRegimeFilter`: 코스피 200일 이동평균선 기반 Risk-On/Risk-Off 판단
 - `TechnicalAnalyzer`: RSI, 20일/60일 이동평균선, 저변동성 기반 기술적 분석
 - `AccumulationAnalyzer`: 네이버 금융 외국인/기관 순매매 기반 수급 매집 분석
