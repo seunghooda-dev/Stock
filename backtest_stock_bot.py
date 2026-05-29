@@ -23,15 +23,24 @@ from stock_telegram_bot import (
     MARKET_REGIME_MA,
     MARKETS,
     MAX_DISTANCE_ABOVE_MA20,
+    MAX_DRAWDOWN_60D,
+    MAX_RETURN_120D,
+    MAX_RETURN_20D,
     MIN_DAILY_TRADING_VALUE,
     MIN_HISTORY_DAYS,
     MIN_MARKET_CAP,
+    MIN_RELATIVE_STRENGTH_60D,
+    MIN_RETURN_20D,
     MIN_RSI,
     RSI_WINDOW,
     ATR_WINDOW,
     MAX_RSI,
     MA_SUPPORT_BAND,
     clamp,
+    env_float,
+    env_float_profile,
+    max_drawdown,
+    return_over_period,
 )
 
 
@@ -63,6 +72,9 @@ class BacktestTrade:
     entry_price: float
     exit_price: float
     stop_loss: float
+    relative_strength_60d: float
+    return_20d: float
+    max_drawdown_60d: float
     return_pct: float
     holding_days: int
     exit_reason: str
@@ -77,7 +89,7 @@ class StrategyBacktester:
 
     def run(self) -> Dict[str, object]:
         universe = self._fetch_universe()
-        regimes = self._build_regime_series()
+        regimes, market_closes = self._build_market_data()
 
         trades: List[BacktestTrade] = []
         for index, stock in enumerate(universe, start=1):
@@ -85,7 +97,7 @@ class StrategyBacktester:
                 logger.info("백테스트 진행률: %d/%d, 누적 거래 %d건", index, len(universe), len(trades))
             try:
                 data = self._fetch_price_data(stock["code"])
-                stock_trades = self._simulate_stock(stock, data, regimes)
+                stock_trades = self._simulate_stock(stock, data, regimes, market_closes)
                 trades.extend(stock_trades)
             except Exception as exc:
                 logger.debug("%s(%s) 백테스트 제외: %s", stock["name"], stock["code"], exc)
@@ -131,13 +143,15 @@ class StrategyBacktester:
         logger.info("백테스트 대상 종목: %d개", len(selected))
         return selected
 
-    def _build_regime_series(self) -> Dict[str, pd.Series]:
-        return {
-            "KOSPI": self._regime_series(MARKET_INDEX_CODE),
-            "KOSDAQ": self._regime_series(KOSDAQ_MARKET_INDEX_CODE),
-        }
+    def _build_market_data(self) -> tuple[Dict[str, pd.Series], Dict[str, pd.Series]]:
+        kospi_regime, kospi_close = self._market_index_data(MARKET_INDEX_CODE)
+        kosdaq_regime, kosdaq_close = self._market_index_data(KOSDAQ_MARKET_INDEX_CODE)
+        return (
+            {"KOSPI": kospi_regime, "KOSDAQ": kosdaq_regime},
+            {"KOSPI": kospi_close, "KOSDAQ": kosdaq_close},
+        )
 
-    def _regime_series(self, index_code: str) -> pd.Series:
+    def _market_index_data(self, index_code: str) -> tuple[pd.Series, pd.Series]:
         data = fdr.DataReader(
             index_code,
             self.warmup_start_date.strftime("%Y-%m-%d"),
@@ -147,7 +161,7 @@ class StrategyBacktester:
             raise RuntimeError(f"{index_code} 시장 국면 데이터를 가져오지 못했습니다.")
         close = data["Close"].astype(float)
         ma200 = close.rolling(MARKET_REGIME_MA).mean()
-        return (close >= ma200).fillna(False)
+        return (close >= ma200).fillna(False), close
 
     def _fetch_price_data(self, code: str) -> pd.DataFrame:
         data = fdr.DataReader(
@@ -183,9 +197,20 @@ class StrategyBacktester:
         stock: Dict[str, object],
         prices: pd.DataFrame,
         regimes: Dict[str, pd.Series],
+        market_closes: Dict[str, pd.Series],
     ) -> List[BacktestTrade]:
         market = str(stock["market"])
         risk_on = regimes.get(market, regimes["KOSPI"]).reindex(prices.index, method="ffill").fillna(False)
+        market_close = market_closes.get(market, market_closes["KOSPI"]).reindex(prices.index, method="ffill")
+        min_relative_strength = env_float_profile(
+            "MIN_RELATIVE_STRENGTH_60D",
+            MIN_RELATIVE_STRENGTH_60D,
+            {"conservative": 3.0, "institutional": 1.0, "balanced": 0.0, "aggressive": -3.0},
+        )
+        min_return_20d = env_float("MIN_RETURN_20D", MIN_RETURN_20D)
+        max_return_20d = env_float("MAX_RETURN_20D", MAX_RETURN_20D)
+        max_return_120d = env_float("MAX_RETURN_120D", MAX_RETURN_120D)
+        max_drawdown_60d_limit = env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D)
         trades: List[BacktestTrade] = []
         i = max(MA_LONG, MARKET_REGIME_MA)
 
@@ -205,6 +230,20 @@ class StrategyBacktester:
             avg_volume20 = float(row.get("AVG_VOLUME20", 0.0))
             volume = float(row.get("Volume", 0.0))
             volume_ratio = volume / avg_volume20 if avg_volume20 > 0 else 1.0
+            close_until_now = prices["Close"].iloc[: i + 1]
+            market_close_until_now = market_close.iloc[: i + 1]
+            return_20d = return_over_period(close_until_now, 20)
+            return_60d = return_over_period(close_until_now, 60)
+            return_120d = return_over_period(close_until_now, 120)
+            market_return_60d = return_over_period(market_close_until_now, 60)
+            relative_strength_60d = return_60d - market_return_60d
+            drawdown_60d = max_drawdown(close_until_now.tail(60))
+            return_quality_signal = (
+                return_20d >= min_return_20d
+                and return_20d <= max_return_20d
+                and return_120d <= max_return_120d
+                and drawdown_60d <= max_drawdown_60d_limit
+            )
 
             entry_signal = (
                 ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)
@@ -212,6 +251,8 @@ class StrategyBacktester:
                 and ma20 > ma60
                 and MIN_RSI <= float(row["RSI"]) <= MAX_RSI
                 and volume_ratio >= self.config.min_volume_ratio
+                and relative_strength_60d >= min_relative_strength
+                and return_quality_signal
             )
             if not entry_signal:
                 i += 1
@@ -236,6 +277,9 @@ class StrategyBacktester:
                     entry_price=round(entry_price, 2),
                     exit_price=round(exit_price, 2),
                     stop_loss=round(stop_loss, 2),
+                    relative_strength_60d=round(relative_strength_60d, 2),
+                    return_20d=round(return_20d, 2),
+                    max_drawdown_60d=round(drawdown_60d, 2),
                     return_pct=round(return_pct, 2),
                     holding_days=holding_days,
                     exit_reason=exit_reason,
@@ -283,6 +327,12 @@ class StrategyBacktester:
             "profit_factor": round(float(profit_factor), 2) if profit_factor is not None else "inf",
             "max_drawdown_pct": round(float(drawdown.min() * 100), 2),
             "avg_holding_days": round(sum(trade.holding_days for trade in trades) / len(trades), 1),
+            "avg_relative_strength_60d_pctp": round(
+                sum(trade.relative_strength_60d for trade in trades) / len(trades),
+                2,
+            ),
+            "avg_entry_return_20d_pct": round(sum(trade.return_20d for trade in trades) / len(trades), 2),
+            "avg_entry_drawdown_60d_pct": round(sum(trade.max_drawdown_60d for trade in trades) / len(trades), 2),
         }
 
     def _save_results(self, trades: List[BacktestTrade], summary: Dict[str, object]) -> None:

@@ -36,6 +36,7 @@ KIS_MAX_RETRIES = 2
 KIS_RETRY_DELAY_SECONDS = 1.0
 
 # Scanner settings
+STRATEGY_PROFILE = "institutional"  # conservative, institutional, balanced, aggressive
 RUN_TIME_KST = "16:00"
 LOOKBACK_DAYS = 220
 MIN_HISTORY_DAYS = 80
@@ -131,6 +132,16 @@ MIN_RSI = 40.0
 MAX_RSI = 55.0
 MA_SUPPORT_BAND = 0.03
 MAX_DISTANCE_ABOVE_MA20 = 0.08
+MIN_RELATIVE_STRENGTH_60D = 0.0
+MIN_RETURN_20D = -8.0
+MAX_RETURN_20D = 25.0
+MAX_RETURN_120D = 120.0
+MAX_DRAWDOWN_60D = 25.0
+
+# Real-order gates are stricter than alert gates.
+AUTO_TRADE_MIN_SCORE = 80.0
+AUTO_TRADE_MIN_DATA_QUALITY = 85.0
+AUTO_TRADE_MAX_STOP_LOSS_PCT = 8.0
 
 MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
@@ -211,6 +222,12 @@ class TechnicalSnapshot:
     previous_close: float = 0.0
     volume: float = 0.0
     avg_volume20: float = 0.0
+    return_20d: float = 0.0
+    return_60d: float = 0.0
+    return_120d: float = 0.0
+    market_return_60d: float = 0.0
+    relative_strength_60d: float = 0.0
+    max_drawdown_60d: float = 0.0
     price_source: str = ""
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
@@ -245,6 +262,9 @@ class MarketRegime:
     volatility: float
     risk_on: bool
     summary: str
+    return_20d: float = 0.0
+    return_60d: float = 0.0
+    return_120d: float = 0.0
 
 
 @dataclass
@@ -630,7 +650,7 @@ class DataQualityValidator:
     def _report(source: str, score: float, checks: List[str], warnings: List[str]) -> DataQualityReport:
         clean_score = round(clamp(score, 0.0, 100.0), 1)
         grade = quality_grade(clean_score)
-        min_score = env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE)
+        min_score = data_quality_min_score()
         passed = clean_score >= min_score or not env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION)
         return DataQualityReport(
             source=source,
@@ -824,7 +844,7 @@ class FinancialScanner:
             return False
         if not all(value > 0 for value in metrics.operating_income_years[:REQUIRED_PROFIT_YEARS]):
             return False
-        if metrics.data_quality_score < env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE):
+        if metrics.data_quality_score < data_quality_min_score():
             return False
         if env_bool("ENABLE_VALUE_TRAP_GUARD", ENABLE_VALUE_TRAP_GUARD) and self._looks_like_value_trap(metrics):
             return False
@@ -1103,10 +1123,13 @@ class MarketRegimeFilter:
         current = float(close.iloc[-1])
         ma200 = float(close.rolling(MARKET_REGIME_MA).mean().iloc[-1])
         volatility = annualized_volatility(close)
+        return_20d = return_over_period(close, 20)
+        return_60d = return_over_period(close, 60)
+        return_120d = return_over_period(close, 120)
         risk_on = current >= ma200
         summary = (
             f"{label} {current:,.2f}, 200일선 {ma200:,.2f}, "
-            f"시장 변동성 {volatility * 100:.1f}%"
+            f"시장 변동성 {volatility * 100:.1f}%, 60일 수익률 {return_60d:+.1f}%"
         )
         logger.info("%s, Risk-On=%s", summary, risk_on)
         return MarketRegime(
@@ -1116,6 +1139,9 @@ class MarketRegimeFilter:
             volatility=volatility,
             risk_on=risk_on,
             summary=summary,
+            return_20d=return_20d,
+            return_60d=return_60d,
+            return_120d=return_120d,
         )
 
     def analyze_by_market(self) -> Dict[str, MarketRegime]:
@@ -1796,13 +1822,38 @@ class TechnicalAnalyzer:
             avg_volume20 = float(latest.get("AVG_VOLUME20", 0.0))
             stop_loss = max(0.0, current_price - (ATR_STOP_MULTIPLIER * atr))
             volatility = annualized_volatility(prices["Close"])
+            close = prices["Close"].astype(float)
+            return_20d = return_over_period(close, 20)
+            return_60d = return_over_period(close, 60)
+            return_120d = return_over_period(close, 120)
+            max_drawdown_60d = max_drawdown(close.tail(60))
+            relative_strength_60d = return_60d - market_regime.return_60d
             ma20_rising = ma20 > float(five_days_ago["MA20"])
             ma20_support = ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)
             medium_uptrend = ma20 > ma60
             rsi_entry_zone = MIN_RSI <= rsi <= MAX_RSI
             low_volatility = volatility <= market_regime.volatility * MAX_RELATIVE_VOLATILITY
+            relative_strength_ok = relative_strength_60d >= env_float_profile(
+                "MIN_RELATIVE_STRENGTH_60D",
+                MIN_RELATIVE_STRENGTH_60D,
+                {"conservative": 3.0, "institutional": 1.0, "balanced": 0.0, "aggressive": -3.0},
+            )
+            return_quality_ok = (
+                return_20d >= env_float("MIN_RETURN_20D", MIN_RETURN_20D)
+                and return_20d <= env_float("MAX_RETURN_20D", MAX_RETURN_20D)
+                and return_120d <= env_float("MAX_RETURN_120D", MAX_RETURN_120D)
+                and max_drawdown_60d <= env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D)
+            )
 
-            if not (ma20_support and ma20_rising and medium_uptrend and rsi_entry_zone and low_volatility):
+            if not (
+                ma20_support
+                and ma20_rising
+                and medium_uptrend
+                and rsi_entry_zone
+                and low_volatility
+                and relative_strength_ok
+                and return_quality_ok
+            ):
                 return None
 
             crossed_ma20 = float(previous["Close"]) <= float(previous["MA20"]) and current_price > ma20
@@ -1824,6 +1875,12 @@ class TechnicalAnalyzer:
                 previous_close=previous_close,
                 volume=volume,
                 avg_volume20=avg_volume20,
+                return_20d=return_20d,
+                return_60d=return_60d,
+                return_120d=return_120d,
+                market_return_60d=market_regime.return_60d,
+                relative_strength_60d=relative_strength_60d,
+                max_drawdown_60d=max_drawdown_60d,
                 price_source=data_quality.source,
                 data_quality_score=data_quality.score,
                 data_quality_grade=data_quality.grade,
@@ -1945,14 +2002,17 @@ class FactorScorer:
     @staticmethod
     def _technical_score(technicals: TechnicalSnapshot) -> float:
         score = 0.0
-        score += clamp((15.0 - abs(technicals.rsi - 45.0)) / 15.0 * 7.0, 0.0, 7.0)
+        score += clamp((15.0 - abs(technicals.rsi - 45.0)) / 15.0 * 5.0, 0.0, 5.0)
         ma_spread = technicals.ma20 / technicals.ma60 - 1 if technicals.ma60 > 0 else 0.0
-        score += clamp(ma_spread / 0.10 * 6.0, 0.0, 6.0)
+        score += clamp(ma_spread / 0.10 * 5.0, 0.0, 5.0)
         ma_distance = abs(technicals.current_price / technicals.ma20 - 1) if technicals.ma20 > 0 else 1.0
-        score += clamp((MAX_DISTANCE_ABOVE_MA20 - ma_distance) / MAX_DISTANCE_ABOVE_MA20 * 5.0, 0.0, 5.0)
+        score += clamp((MAX_DISTANCE_ABOVE_MA20 - ma_distance) / MAX_DISTANCE_ABOVE_MA20 * 4.0, 0.0, 4.0)
         volume_ratio = technicals.volume / technicals.avg_volume20 if technicals.avg_volume20 > 0 else 1.0
-        score += clamp(volume_ratio / 2.0 * 4.0, 0.0, 4.0)
-        score += 3.0 if "상향 돌파" in technicals.trend_summary else 1.5
+        score += clamp(volume_ratio / 2.0 * 3.0, 0.0, 3.0)
+        score += clamp((technicals.relative_strength_60d + 5.0) / 20.0 * 5.0, 0.0, 5.0)
+        drawdown_limit = max(1.0, env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D))
+        score += clamp((drawdown_limit - technicals.max_drawdown_60d) / drawdown_limit * 3.0, 0.0, 3.0)
+        score += 2.0 if "상향 돌파" in technicals.trend_summary else 1.0
         return clamp(score, 0.0, 25.0)
 
     @staticmethod
@@ -1980,6 +2040,7 @@ class FactorScorer:
             notes.extend(report.financials.quality_notes[:3])
         if report.accumulation:
             notes.append(f"수급 {report.accumulation.net_buy_amount_to_market_cap or 0:.2%}/시총")
+        notes.append(f"60일 상대강도 {report.technicals.relative_strength_60d:+.1f}%p")
         notes.append(report.technicals.trend_summary)
         return notes[:5]
 
@@ -1991,7 +2052,7 @@ class FactorScorer:
             return "A"
         if total >= 65:
             return "B+"
-        if total >= MIN_FACTOR_SCORE:
+        if total >= factor_score_minimum():
             return "B"
         return "C"
 
@@ -2078,6 +2139,21 @@ class TradingEngine:
         self.use_hashkey = env_bool("AUTO_TRADE_USE_HASHKEY", AUTO_TRADE_USE_HASHKEY)
         self.use_risk_sizing = env_bool("AUTO_TRADE_USE_RISK_SIZING", AUTO_TRADE_USE_RISK_SIZING)
         self.risk_per_trade_krw = env_float("AUTO_TRADE_RISK_PER_TRADE_KRW", AUTO_TRADE_RISK_PER_TRADE_KRW)
+        self.min_score = env_float_profile(
+            "AUTO_TRADE_MIN_SCORE",
+            AUTO_TRADE_MIN_SCORE,
+            {"conservative": 85.0, "institutional": 82.0, "balanced": 78.0, "aggressive": 72.0},
+        )
+        self.min_data_quality = env_float_profile(
+            "AUTO_TRADE_MIN_DATA_QUALITY",
+            AUTO_TRADE_MIN_DATA_QUALITY,
+            {"conservative": 90.0, "institutional": 85.0, "balanced": 82.0, "aggressive": 78.0},
+        )
+        self.max_stop_loss_pct = env_float_profile(
+            "AUTO_TRADE_MAX_STOP_LOSS_PCT",
+            AUTO_TRADE_MAX_STOP_LOSS_PCT,
+            {"conservative": 6.0, "institutional": 8.0, "balanced": 9.0, "aggressive": 12.0},
+        )
 
     def prepare_buy_plans(self, reports: List[DiscoveryReport], market_regime: MarketRegime) -> List[OrderPlan]:
         if not market_regime.risk_on or not reports:
@@ -2092,6 +2168,8 @@ class TradingEngine:
                 break
             if self._recently_traded(report.stock.code, history):
                 logger.info("%s(%s) 최근 자동매매 이력으로 주문 후보 제외", report.stock.name, report.stock.code)
+                continue
+            if not self._passes_auto_trade_gate(report):
                 continue
 
             current_price = report.technicals.current_price
@@ -2132,6 +2210,42 @@ class TradingEngine:
             planned_value += estimated_value
 
         return plans
+
+    def _passes_auto_trade_gate(self, report: DiscoveryReport) -> bool:
+        score = report.score.total if report.score else 0.0
+        if score < self.min_score:
+            logger.info(
+                "%s(%s) 자동매매 점수 %.1f 미달(기준 %.1f)",
+                report.stock.name,
+                report.stock.code,
+                score,
+                self.min_score,
+            )
+            return False
+        if report.data_quality_score < self.min_data_quality:
+            logger.info(
+                "%s(%s) 자동매매 데이터 신뢰도 %.1f 미달(기준 %.1f)",
+                report.stock.name,
+                report.stock.code,
+                report.data_quality_score,
+                self.min_data_quality,
+            )
+            return False
+        current_price = report.technicals.current_price
+        stop_loss = report.technicals.stop_loss
+        if current_price <= 0 or stop_loss <= 0:
+            return False
+        stop_loss_pct = (current_price - stop_loss) / current_price * 100
+        if stop_loss_pct > self.max_stop_loss_pct:
+            logger.info(
+                "%s(%s) 손절폭 %.1f%% 초과(기준 %.1f%%)",
+                report.stock.name,
+                report.stock.code,
+                stop_loss_pct,
+                self.max_stop_loss_pct,
+            )
+            return False
+        return True
 
     def save_pending_plans(self, plans: List[OrderPlan]) -> None:
         if not self.enabled or not plans:
@@ -2198,6 +2312,7 @@ class TradingEngine:
         return (
             f"{mode}, {self.kis_provider.trading_env}, 계좌 {account}, "
             f"주문시간 {self.run_time}, 1회 최대 {self.max_orders_per_run}건, "
+            f"최소점수 {self.min_score:.1f}, 최소DQ {self.min_data_quality:.1f}, "
             f"종목당 위험한도 {self.risk_per_trade_krw:,.0f}원"
         )
 
@@ -2443,7 +2558,7 @@ class RealtimeScanner:
                 data_quality_score = float(item.get("data_quality_score", 0.0))
                 if (
                     env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION)
-                    and data_quality_score < env_float("MIN_DATA_QUALITY_SCORE", MIN_DATA_QUALITY_SCORE)
+                    and data_quality_score < data_quality_min_score()
                 ):
                     continue
                 candidates.append(
@@ -2604,7 +2719,8 @@ class RealtimeScanner:
             f"유동비율 {financials.current_ratio:.1f}%, PBR {financials.pbr:.2f}, "
             f"ROE {format_optional_percent(financials.roe)}\n"
             f"📌 기준: RSI {technicals.rsi:.1f}, 20일선 {technicals.ma20:,.0f}원, "
-            f"거래량 페이스 {signal.volume_pace_ratio:.1f}배\n"
+            f"거래량 페이스 {signal.volume_pace_ratio:.1f}배, "
+            f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원\n"
             f"🏦 수급: {format_accumulation(candidate.accumulation)}\n"
             f"💡 {candidate.reason}"
@@ -2719,7 +2835,7 @@ class FinancialHealthBot:
         financially_strong = self.financial_scanner.scan(universe)
 
         reports: List[DiscoveryReport] = []
-        min_factor_score = env_float("MIN_FACTOR_SCORE", MIN_FACTOR_SCORE)
+        min_factor_score = factor_score_minimum()
         for metrics in financially_strong:
             stock_meta = stock_map.get(metrics.code)
             if stock_meta is None:
@@ -2806,6 +2922,8 @@ class FinancialHealthBot:
             f"ROE {format_optional_percent(financials.roe)}\n"
             f"📈 타점: {technicals.trend_summary} "
             f"(현재가 {technicals.current_price:,.0f}원, RSI {technicals.rsi:.1f})\n"
+            f"🚀 상대강도: 60일 {technicals.relative_strength_60d:+.1f}%p, "
+            f"20일 수익률 {technicals.return_20d:+.1f}%\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원 "
             f"(ATR {technicals.atr:,.0f}원 기준)\n"
             f"🏦 수급: {format_accumulation(report.accumulation)}\n"
@@ -2912,7 +3030,15 @@ class FinancialHealthBot:
                         f"{technicals.trend_summary} "
                         f"(현재가 {technicals.current_price:,.0f}원, "
                         f"RSI {technicals.rsi:.1f}, "
-                        f"20일선 {technicals.ma20:,.0f}원)"
+                        f"20일선 {technicals.ma20:,.0f}원, "
+                        f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p)"
+                    ),
+                    (
+                        "🚀 모멘텀 품질: "
+                        f"20일 {technicals.return_20d:+.1f}%, "
+                        f"60일 {technicals.return_60d:+.1f}%, "
+                        f"120일 {technicals.return_120d:+.1f}%, "
+                        f"60일 최대낙폭 {technicals.max_drawdown_60d:.1f}%"
                     ),
                     (
                         "🛡️ 리스크 관리: "
@@ -3107,6 +3233,36 @@ def env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def active_strategy_profile() -> str:
+    profile = os.getenv("STRATEGY_PROFILE", STRATEGY_PROFILE).strip().lower()
+    if profile not in {"conservative", "institutional", "balanced", "aggressive"}:
+        logger.warning("알 수 없는 STRATEGY_PROFILE=%s, institutional 사용", profile)
+        return "institutional"
+    return profile
+
+
+def env_float_profile(name: str, default: float, profile_defaults: Dict[str, float]) -> float:
+    if os.getenv(name) is not None:
+        return env_float(name, default)
+    return float(profile_defaults.get(active_strategy_profile(), default))
+
+
+def factor_score_minimum() -> float:
+    return env_float_profile(
+        "MIN_FACTOR_SCORE",
+        MIN_FACTOR_SCORE,
+        {"conservative": 80.0, "institutional": 72.0, "balanced": 68.0, "aggressive": 64.0},
+    )
+
+
+def data_quality_min_score() -> float:
+    return env_float_profile(
+        "MIN_DATA_QUALITY_SCORE",
+        MIN_DATA_QUALITY_SCORE,
+        {"conservative": 90.0, "institutional": 80.0, "balanced": 75.0, "aggressive": 70.0},
+    )
+
+
 def parse_hhmm(value: str) -> tuple[int, int]:
     hour_text, minute_text = value.strip().split(":", 1)
     return int(hour_text), int(minute_text)
@@ -3189,6 +3345,26 @@ def annualized_volatility(close: pd.Series) -> float:
     if returns.empty:
         return 0.0
     return float(returns.tail(120).std() * (252 ** 0.5))
+
+
+def return_over_period(close: pd.Series, days: int) -> float:
+    values = close.dropna().astype(float)
+    if len(values) <= days:
+        return 0.0
+    previous = float(values.iloc[-days - 1])
+    current = float(values.iloc[-1])
+    if previous <= 0:
+        return 0.0
+    return (current / previous - 1) * 100
+
+
+def max_drawdown(close: pd.Series) -> float:
+    values = close.dropna().astype(float)
+    if values.empty:
+        return 0.0
+    running_max = values.cummax()
+    drawdown = values / running_max - 1
+    return abs(float(drawdown.min() * 100))
 
 
 def run_scheduled_job(bot: FinancialHealthBot) -> None:

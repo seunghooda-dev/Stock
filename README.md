@@ -95,6 +95,9 @@ AUTO_TRADE_MAX_PORTFOLIO_EXPOSURE_KRW=1000000
 AUTO_TRADE_PENDING_MAX_AGE_HOURS=20
 AUTO_TRADE_USE_RISK_SIZING=true
 AUTO_TRADE_RISK_PER_TRADE_KRW=50000
+AUTO_TRADE_MIN_SCORE=82
+AUTO_TRADE_MIN_DATA_QUALITY=85
+AUTO_TRADE_MAX_STOP_LOSS_PCT=8
 ```
 
 실제 주문을 보내려면 아래 값을 모두 의도적으로 바꿔야 합니다.
@@ -116,6 +119,17 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 데이터 신뢰도 검증은 기본적으로 켜져 있습니다. `STRICT_DATA_VALIDATION=true`이면 가격, 재무, 수급의 통합 데이터 신뢰도가 `MIN_DATA_QUALITY_SCORE` 미만인 종목은 추천/주문 후보에서 제외합니다. `ENABLE_PRICE_CROSSCHECK=true`이면 KIS 일봉과 FDR 일봉의 공통 거래일 종가를 비교해 차이가 `MAX_CROSS_SOURCE_CLOSE_DIFF_PCT`를 넘는지 확인합니다. 두 소스의 종가가 같더라도 최신 거래일이 다르면 경고를 남기고, FDR이 더 최신이면 최신 가격 기준을 우선 사용합니다.
 
 KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 `KIS_RETRY_DELAY_SECONDS` 설정에 따라 재시도합니다. 실제 주문 전송 API는 중복 주문 방지를 위해 자동 재시도하지 않습니다.
+
+## 전략 프로파일
+
+기본값은 `STRATEGY_PROFILE=institutional`입니다. 프로파일은 명시적으로 개별 값을 지정하지 않은 설정의 기본 기준을 바꿉니다.
+
+- `conservative`: 후보 수는 적지만 점수, 데이터 신뢰도, 손절폭 기준을 가장 엄격하게 적용
+- `institutional`: 기본 추천값. 수급, 상대강도, 데이터 신뢰도, 리스크를 균형 있게 강화
+- `balanced`: 후보 수와 엄격함을 중간으로 조절
+- `aggressive`: 더 많은 후보를 보되 실전 주문 전 방어 게이트는 유지
+
+현재 권장값은 `institutional`, `MIN_FACTOR_SCORE=72`, `MIN_DATA_QUALITY_SCORE=80`, `AUTO_TRADE_MIN_SCORE=82`, `AUTO_TRADE_MIN_DATA_QUALITY=85`입니다.
 
 ## 실행
 
@@ -197,6 +211,8 @@ REALTIME_MAX_WATCHLIST=50
 - 20일 이동평균선이 60일 이동평균선 위
 - RSI(14)가 40~55 진입 구간
 - 최근 120거래일 변동성이 시장 변동성의 110% 이하
+- 60일 수익률이 해당 시장 지수보다 우월한 상대강도 조건 통과
+- 20일/120일 수익률 과열과 60일 최대낙폭 조건 통과
 
 ## 리스크 관리
 
@@ -204,6 +220,7 @@ REALTIME_MAX_WATCHLIST=50
 - 손절선은 `현재가 - 2 * ATR`로 표시합니다.
 - 유동성이 낮은 종목은 호가 공백과 체결 리스크가 크기 때문에 사전에 제외합니다.
 - 자동매매는 1회 주문 수, 종목당 예산, 1회 총 노출 한도, 동일 종목 재진입 쿨다운을 적용합니다.
+- 알림 후보보다 자동매매 후보 기준이 더 높습니다. 기본값은 종합점수 82점 이상, 데이터 신뢰도 85점 이상, ATR 손절폭 8% 이하입니다.
 - 주문 실행 직전에도 시장 국면을 재확인하고, Risk-Off면 대기 주문을 폐기합니다.
 - 실전 주문은 `AUTO_TRADE_CONFIRM_REAL_TRADING=YES`가 없으면 코드상에서 차단됩니다.
 - `AUTO_TRADE_USE_RISK_SIZING=true`일 때는 고정 매수금액만 보지 않고, `매수가 - ATR 손절가` 기준으로 종목당 예상 손실이 `AUTO_TRADE_RISK_PER_TRADE_KRW`를 넘지 않게 수량을 줄입니다.
@@ -220,11 +237,11 @@ REALTIME_MAX_WATCHLIST=50
 
 ## 팩터 점수화
 
-최종 후보는 단순 조건 통과가 아니라 100점 만점 점수로 다시 정렬합니다. 기본 통과선은 `MIN_FACTOR_SCORE=60`입니다.
+최종 후보는 단순 조건 통과가 아니라 100점 만점 점수로 다시 정렬합니다. `institutional` 프로파일의 기본 통과선은 `MIN_FACTOR_SCORE=72`입니다.
 
 - 재무 30점: PBR, 부채비율, 유동비율, ROE, 영업이익률, 매출 성장
 - 수급 25점: 상장주식수 대비 순매수, 시총 대비 순매수금액, 양수급 일수, 횡보 여부
-- 기술 25점: RSI 위치, 20/60일선 스프레드, 20일선 근접도, 거래량, 상향 돌파
+- 기술 25점: RSI 위치, 20/60일선 스프레드, 20일선 근접도, 거래량, 시장 대비 60일 상대강도, 60일 최대낙폭, 상향 돌파
 - 리스크 20점: 시장 국면, 시장 대비 변동성, ATR 손절 폭, 거래대금
 
 ## 데이터 검증
