@@ -37,6 +37,7 @@ LOOKBACK_DAYS = 220
 MIN_HISTORY_DAYS = 80
 MAX_REPORTS = 20
 REQUEST_DELAY_SECONDS = 0.15
+KIS_DAILY_CHUNK_DAYS = 60
 FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
 IMMEDIATE_ALERTS_ENABLED = True
@@ -530,19 +531,11 @@ class KISDataProvider:
         if not self.enabled:
             raise RuntimeError("KIS_APP_KEY 또는 KIS_APP_SECRET이 설정되지 않았습니다.")
 
-        payload = self._get(
-            path=self.DAILY_PRICE_PATH,
-            tr_id="FHKST03010100",
-            params={
-                "FID_COND_MRKT_DIV_CODE": "J",
-                "FID_INPUT_ISCD": code,
-                "FID_INPUT_DATE_1": compact_date(start_date),
-                "FID_INPUT_DATE_2": compact_date(end_date),
-                "FID_PERIOD_DIV_CODE": "D",
-                "FID_ORG_ADJ_PRC": "0",
-            },
-        )
-        rows = payload.get("output2") or []
+        rows: List[object] = []
+        for chunk_start, chunk_end in date_chunks(start_date, end_date, KIS_DAILY_CHUNK_DAYS):
+            rows.extend(self._fetch_daily_price_rows(code, chunk_start, chunk_end))
+            time.sleep(REQUEST_DELAY_SECONDS)
+
         if not rows:
             raise ValueError(f"{code} KIS 일봉 데이터가 비어 있습니다.")
 
@@ -564,8 +557,44 @@ class KISDataProvider:
         if data.empty:
             raise ValueError(f"{code} KIS 일봉 데이터 파싱 결과가 비어 있습니다.")
 
-        data = data.set_index("Date").sort_index()
+        data = data.drop_duplicates(subset=["Date"]).set_index("Date").sort_index()
         return data[["Open", "High", "Low", "Close", "Volume", "Amount"]]
+
+    def _fetch_daily_price_rows(self, code: str, start_date: str, end_date: str) -> List[object]:
+        last_error: Optional[Exception] = None
+        for adjusted_price in ("1", "0"):
+            try:
+                payload = self._get(
+                    path=self.DAILY_PRICE_PATH,
+                    tr_id="FHKST03010100",
+                    params={
+                        "FID_COND_MRKT_DIV_CODE": "J",
+                        "FID_INPUT_ISCD": code,
+                        "FID_INPUT_DATE_1": compact_date(start_date),
+                        "FID_INPUT_DATE_2": compact_date(end_date),
+                        "FID_PERIOD_DIV_CODE": "D",
+                        "FID_ORG_ADJ_PRC": adjusted_price,
+                    },
+                )
+                return list(payload.get("output2") or [])
+            except Exception as exc:
+                last_error = exc
+
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+        if start >= end:
+            logger.debug("%s KIS 일봉 단일 날짜 조회 실패: %s, %s", code, start_date, last_error)
+            return []
+
+        midpoint = start + ((end - start) / 2)
+        left_end = midpoint.strftime("%Y-%m-%d")
+        right_start = (midpoint + timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.debug("%s KIS 일봉 구간 재시도: %s~%s", code, start_date, end_date)
+        return self._fetch_daily_price_rows(code, start_date, left_end) + self._fetch_daily_price_rows(
+            code,
+            right_start,
+            end_date,
+        )
 
     def fetch_current_price(self, code: str) -> Dict[str, Optional[float]]:
         if not self.enabled:
@@ -650,7 +679,7 @@ class KISDataProvider:
             params=params,
             timeout=20,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, path)
         return self._validate_payload(response.json())
 
     def _post(
@@ -671,7 +700,7 @@ class KISDataProvider:
             json=body,
             timeout=20,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, path)
         return self._validate_payload(response.json())
 
     def _create_hashkey(self, token: str, body: Dict[str, str]) -> str:
@@ -681,7 +710,7 @@ class KISDataProvider:
             json=body,
             timeout=20,
         )
-        response.raise_for_status()
+        self._raise_for_status(response, self.HASHKEY_PATH)
         payload = response.json()
         hashkey = payload.get("HASH")
         if not hashkey:
@@ -705,6 +734,13 @@ class KISDataProvider:
         if str(payload.get("rt_cd", "0")) != "0":
             raise RuntimeError(f"KIS API 오류 {payload.get('msg_cd')}: {payload.get('msg1')}")
         return payload
+
+    @staticmethod
+    def _raise_for_status(response: requests.Response, path: str) -> None:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            raise RuntimeError(f"KIS HTTP {response.status_code} error: {path}") from None
 
     def _cash_order_tr_id(self, side: str) -> str:
         if self.trading_env == "real":
@@ -1021,7 +1057,9 @@ class Notifier:
                 )
                 response.raise_for_status()
         except requests.RequestException as exc:
-            logger.exception("텔레그램 메시지 전송 실패: %s", exc)
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", "N/A")
+            logger.error("텔레그램 메시지 전송 실패: HTTP %s", status)
             return False
 
         logger.info("텔레그램 메시지 전송 완료")
@@ -1666,6 +1704,18 @@ def mask_account(account_no: str, product_code: str) -> str:
         return "미설정"
     visible = account_no[-2:] if len(account_no) >= 2 else account_no
     return f"******{visible}-{product_code or '**'}"
+
+
+def date_chunks(start_date: str, end_date: str, chunk_days: int) -> List[tuple[str, str]]:
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    chunks: List[tuple[str, str]] = []
+    current = start
+    while current <= end:
+        chunk_end = min(current + timedelta(days=max(1, chunk_days)), end)
+        chunks.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        current = chunk_end + timedelta(days=1)
+    return chunks
 
 
 def compact_date(value: str) -> str:
