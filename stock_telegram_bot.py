@@ -137,6 +137,12 @@ MIN_RETURN_20D = -8.0
 MAX_RETURN_20D = 25.0
 MAX_RETURN_120D = 120.0
 MAX_DRAWDOWN_60D = 25.0
+ENABLE_INVESTMENT_THESIS_FILTER = True
+MIN_INVESTMENT_THESIS_SCORE = 70.0
+MIN_INTERMEDIATE_MOMENTUM_120_20D = -5.0
+MIN_HIGH_PROXIMITY_180D = 65.0
+MAX_HIGH_PROXIMITY_180D = 104.0
+MIN_RISK_REWARD_RATIO = 1.15
 
 # Real-order gates are stricter than alert gates.
 AUTO_TRADE_MIN_SCORE = 80.0
@@ -233,6 +239,13 @@ class TechnicalSnapshot:
     market_return_60d: float = 0.0
     relative_strength_60d: float = 0.0
     max_drawdown_60d: float = 0.0
+    momentum_120_20d: float = 0.0
+    high_180d: float = 0.0
+    low_180d: float = 0.0
+    high_proximity_180d: float = 0.0
+    distance_to_180d_high_pct: float = 0.0
+    target_price: float = 0.0
+    risk_reward_ratio: float = 0.0
     price_source: str = ""
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
@@ -283,6 +296,7 @@ class DiscoveryReport:
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
     data_quality_warnings: List[str] = field(default_factory=list)
+    thesis: Optional["InvestmentThesis"] = None
     decision: Optional["SignalDecision"] = None
 
 
@@ -304,6 +318,19 @@ class SignalDecision:
     trade_eligible: bool
     reasons: List[str] = field(default_factory=list)
     vetoes: List[str] = field(default_factory=list)
+
+
+@dataclass
+class InvestmentThesis:
+    quality: float
+    value: float
+    momentum: float
+    psychology: float
+    asymmetry: float
+    total: float
+    label: str
+    strengths: List[str] = field(default_factory=list)
+    concerns: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -345,6 +372,7 @@ class RealtimeCandidate:
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
     data_quality_warnings: List[str] = field(default_factory=list)
+    thesis: Optional[InvestmentThesis] = None
     decision: Optional[SignalDecision] = None
 
 
@@ -1843,6 +1871,15 @@ class TechnicalAnalyzer:
             return_60d = return_over_period(close, 60)
             return_120d = return_over_period(close, 120)
             max_drawdown_60d = max_drawdown(close.tail(60))
+            momentum_120_20d = return_between_periods(close, 120, 20)
+            high_window = close.tail(min(len(close), 180))
+            high_180d = float(high_window.max()) if not high_window.empty else current_price
+            low_180d = float(high_window.min()) if not high_window.empty else current_price
+            high_proximity_180d = current_price / high_180d * 100 if high_180d > 0 else 0.0
+            distance_to_180d_high_pct = (high_180d / current_price - 1) * 100 if current_price > 0 else 0.0
+            target_price = max(high_180d, ma20 + atr * 3.0)
+            downside = max(current_price - stop_loss, 1.0)
+            risk_reward_ratio = max(0.0, (target_price - current_price) / downside)
             relative_strength_60d = return_60d - market_regime.return_60d
             ma20_rising = ma20 > float(five_days_ago["MA20"])
             ma20_support = ma20 * (1 - MA_SUPPORT_BAND) <= current_price <= ma20 * (1 + MAX_DISTANCE_ABOVE_MA20)
@@ -1860,6 +1897,27 @@ class TechnicalAnalyzer:
                 and return_120d <= env_float("MAX_RETURN_120D", MAX_RETURN_120D)
                 and max_drawdown_60d <= env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D)
             )
+            momentum_durability_ok = (
+                momentum_120_20d
+                >= env_float_profile(
+                    "MIN_INTERMEDIATE_MOMENTUM_120_20D",
+                    MIN_INTERMEDIATE_MOMENTUM_120_20D,
+                    {"conservative": 0.0, "institutional": -2.0, "balanced": -5.0, "aggressive": -10.0},
+                )
+                and high_proximity_180d
+                >= env_float_profile(
+                    "MIN_HIGH_PROXIMITY_180D",
+                    MIN_HIGH_PROXIMITY_180D,
+                    {"conservative": 72.0, "institutional": 68.0, "balanced": 65.0, "aggressive": 58.0},
+                )
+                and high_proximity_180d <= env_float("MAX_HIGH_PROXIMITY_180D", MAX_HIGH_PROXIMITY_180D)
+                and risk_reward_ratio
+                >= env_float_profile(
+                    "MIN_RISK_REWARD_RATIO",
+                    MIN_RISK_REWARD_RATIO,
+                    {"conservative": 1.35, "institutional": 1.15, "balanced": 1.0, "aggressive": 0.8},
+                )
+            )
 
             if not (
                 ma20_support
@@ -1869,6 +1927,7 @@ class TechnicalAnalyzer:
                 and low_volatility
                 and relative_strength_ok
                 and return_quality_ok
+                and momentum_durability_ok
             ):
                 return None
 
@@ -1897,6 +1956,13 @@ class TechnicalAnalyzer:
                 market_return_60d=market_regime.return_60d,
                 relative_strength_60d=relative_strength_60d,
                 max_drawdown_60d=max_drawdown_60d,
+                momentum_120_20d=momentum_120_20d,
+                high_180d=high_180d,
+                low_180d=low_180d,
+                high_proximity_180d=high_proximity_180d,
+                distance_to_180d_high_pct=distance_to_180d_high_pct,
+                target_price=target_price,
+                risk_reward_ratio=risk_reward_ratio,
                 price_source=data_quality.source,
                 data_quality_score=data_quality.score,
                 data_quality_grade=data_quality.grade,
@@ -2018,17 +2084,20 @@ class FactorScorer:
     @staticmethod
     def _technical_score(technicals: TechnicalSnapshot) -> float:
         score = 0.0
-        score += clamp((15.0 - abs(technicals.rsi - 45.0)) / 15.0 * 5.0, 0.0, 5.0)
+        score += clamp((15.0 - abs(technicals.rsi - 45.0)) / 15.0 * 4.0, 0.0, 4.0)
         ma_spread = technicals.ma20 / technicals.ma60 - 1 if technicals.ma60 > 0 else 0.0
-        score += clamp(ma_spread / 0.10 * 5.0, 0.0, 5.0)
+        score += clamp(ma_spread / 0.10 * 4.0, 0.0, 4.0)
         ma_distance = abs(technicals.current_price / technicals.ma20 - 1) if technicals.ma20 > 0 else 1.0
-        score += clamp((MAX_DISTANCE_ABOVE_MA20 - ma_distance) / MAX_DISTANCE_ABOVE_MA20 * 4.0, 0.0, 4.0)
+        score += clamp((MAX_DISTANCE_ABOVE_MA20 - ma_distance) / MAX_DISTANCE_ABOVE_MA20 * 3.0, 0.0, 3.0)
         volume_ratio = technicals.volume / technicals.avg_volume20 if technicals.avg_volume20 > 0 else 1.0
-        score += clamp(volume_ratio / 2.0 * 3.0, 0.0, 3.0)
-        score += clamp((technicals.relative_strength_60d + 5.0) / 20.0 * 5.0, 0.0, 5.0)
+        score += clamp(volume_ratio / 2.0 * 2.5, 0.0, 2.5)
+        score += clamp((technicals.relative_strength_60d + 5.0) / 20.0 * 4.0, 0.0, 4.0)
         drawdown_limit = max(1.0, env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D))
-        score += clamp((drawdown_limit - technicals.max_drawdown_60d) / drawdown_limit * 3.0, 0.0, 3.0)
-        score += 2.0 if "상향 돌파" in technicals.trend_summary else 1.0
+        score += clamp((drawdown_limit - technicals.max_drawdown_60d) / drawdown_limit * 2.0, 0.0, 2.0)
+        score += clamp((technicals.momentum_120_20d + 5.0) / 25.0 * 2.5, 0.0, 2.5)
+        score += clamp((technicals.high_proximity_180d - 60.0) / 35.0 * 2.0, 0.0, 2.0)
+        score += clamp(technicals.risk_reward_ratio / 2.0 * 2.0, 0.0, 2.0)
+        score += 1.0 if "상향 돌파" in technicals.trend_summary else 0.5
         return clamp(score, 0.0, 25.0)
 
     @staticmethod
@@ -2057,6 +2126,7 @@ class FactorScorer:
         if report.accumulation:
             notes.append(f"수급 {report.accumulation.net_buy_amount_to_market_cap or 0:.2%}/시총")
         notes.append(f"60일 상대강도 {report.technicals.relative_strength_60d:+.1f}%p")
+        notes.append(f"중기 모멘텀 {report.technicals.momentum_120_20d:+.1f}%")
         notes.append(report.technicals.trend_summary)
         return notes[:5]
 
@@ -2071,6 +2141,164 @@ class FactorScorer:
         if total >= factor_score_minimum():
             return "B"
         return "C"
+
+
+class InvestmentThesisBuilder:
+    def build(self, report: DiscoveryReport) -> InvestmentThesis:
+        quality = self._quality_score(report.financials)
+        value = self._value_score(report.financials)
+        momentum = self._momentum_score(report.technicals)
+        psychology = self._psychology_score(report)
+        asymmetry = self._asymmetry_score(report)
+        total = quality + value + momentum + psychology + asymmetry
+        strengths = self._strengths(report, quality, value, momentum, psychology, asymmetry)
+        concerns = self._concerns(report, quality, value, momentum, psychology, asymmetry)
+        return InvestmentThesis(
+            quality=round(quality, 1),
+            value=round(value, 1),
+            momentum=round(momentum, 1),
+            psychology=round(psychology, 1),
+            asymmetry=round(asymmetry, 1),
+            total=round(total, 1),
+            label=self._label(total),
+            strengths=strengths[:5],
+            concerns=concerns[:5],
+        )
+
+    @staticmethod
+    def _quality_score(metrics: FinancialMetrics) -> float:
+        score = 0.0
+        score += clamp((MAX_DEBT_TO_EQUITY - metrics.debt_to_equity) / MAX_DEBT_TO_EQUITY * 5.0, 0.0, 5.0)
+        score += clamp((metrics.current_ratio - MIN_CURRENT_RATIO) / 200.0 * 4.0, 0.0, 4.0)
+        if metrics.roe is not None:
+            score += clamp(metrics.roe / 18.0 * 6.0, 0.0, 6.0)
+        else:
+            score += 2.0
+        if metrics.operating_margin is not None:
+            score += clamp(metrics.operating_margin / 15.0 * 5.0, 0.0, 5.0)
+        else:
+            score += 2.0
+        if len(metrics.operating_income_years) >= REQUIRED_PROFIT_YEARS:
+            positive_years = sum(1 for value in metrics.operating_income_years[:4] if value > 0)
+            score += clamp(positive_years / 4.0 * 3.0, 0.0, 3.0)
+        if metrics.revenue_growth_yoy is not None:
+            score += clamp((metrics.revenue_growth_yoy + 5.0) / 25.0 * 2.0, 0.0, 2.0)
+        else:
+            score += 1.0
+        return clamp(score, 0.0, 25.0)
+
+    @staticmethod
+    def _value_score(metrics: FinancialMetrics) -> float:
+        score = 0.0
+        score += clamp((MAX_PBR - metrics.pbr) / MAX_PBR * 12.0, 0.0, 12.0)
+        if metrics.per is not None and metrics.per > 0:
+            score += clamp((18.0 - metrics.per) / 18.0 * 5.0, 0.0, 5.0)
+        else:
+            score += 2.0
+        if metrics.roe is not None and metrics.roe >= MIN_ROE:
+            score += clamp((metrics.roe - MIN_ROE) / 15.0 * 4.0, 0.0, 4.0)
+        if metrics.operating_margin is not None and metrics.operating_margin >= MIN_OPERATING_MARGIN:
+            score += clamp((metrics.operating_margin - MIN_OPERATING_MARGIN) / 12.0 * 2.0, 0.0, 2.0)
+        if metrics.operating_income_growth_yoy is not None:
+            score += clamp((metrics.operating_income_growth_yoy + 20.0) / 50.0 * 2.0, 0.0, 2.0)
+        else:
+            score += 1.0
+        return clamp(score, 0.0, 25.0)
+
+    @staticmethod
+    def _momentum_score(technicals: TechnicalSnapshot) -> float:
+        score = 0.0
+        score += clamp((technicals.relative_strength_60d + 5.0) / 25.0 * 7.0, 0.0, 7.0)
+        score += clamp((technicals.momentum_120_20d + 5.0) / 30.0 * 6.0, 0.0, 6.0)
+        score += clamp((technicals.high_proximity_180d - 60.0) / 38.0 * 5.0, 0.0, 5.0)
+        ma_spread = technicals.ma20 / technicals.ma60 - 1 if technicals.ma60 > 0 else 0.0
+        score += clamp(ma_spread / 0.12 * 4.0, 0.0, 4.0)
+        volume_ratio = technicals.volume / technicals.avg_volume20 if technicals.avg_volume20 > 0 else 1.0
+        score += clamp(volume_ratio / 2.0 * 3.0, 0.0, 3.0)
+        return clamp(score, 0.0, 25.0)
+
+    @staticmethod
+    def _psychology_score(report: DiscoveryReport) -> float:
+        technicals = report.technicals
+        score = 0.0
+        score += clamp((MAX_RETURN_20D - max(0.0, technicals.return_20d)) / MAX_RETURN_20D * 4.0, 0.0, 4.0)
+        score += clamp((MAX_DRAWDOWN_60D - technicals.max_drawdown_60d) / MAX_DRAWDOWN_60D * 3.0, 0.0, 3.0)
+        score += clamp((MAX_RSI - technicals.rsi) / (MAX_RSI - MIN_RSI) * 2.0, 0.0, 2.0)
+        if report.accumulation is not None:
+            score += clamp((MAX_SIDEWAYS_PRICE_CHANGE - abs(report.accumulation.price_change)) / MAX_SIDEWAYS_PRICE_CHANGE * 3.0, 0.0, 3.0)
+            score += clamp(report.accumulation.positive_days / ACCUMULATION_LOOKBACK_DAYS * 3.0, 0.0, 3.0)
+        else:
+            score += 2.0
+        return clamp(score, 0.0, 15.0)
+
+    @staticmethod
+    def _asymmetry_score(report: DiscoveryReport) -> float:
+        technicals = report.technicals
+        score = 0.0
+        score += clamp(technicals.risk_reward_ratio / 2.5 * 5.0, 0.0, 5.0)
+        stop_loss_pct = DecisionPolicy._stop_loss_pct(technicals)
+        score += clamp((12.0 - stop_loss_pct) / 12.0 * 3.0, 0.0, 3.0)
+        if report.stock.trading_value:
+            score += clamp(report.stock.trading_value / 5_000_000_000 * 2.0, 0.0, 2.0)
+        return clamp(score, 0.0, 10.0)
+
+    @staticmethod
+    def _strengths(
+        report: DiscoveryReport,
+        quality: float,
+        value: float,
+        momentum: float,
+        psychology: float,
+        asymmetry: float,
+    ) -> List[str]:
+        strengths: List[str] = []
+        if quality >= 18:
+            strengths.append("품질: 부채/유동성/수익성 조합 우수")
+        if value >= 17:
+            strengths.append("가치: PBR·이익 대비 할인 매력")
+        if momentum >= 17:
+            strengths.append("모멘텀: 시장 대비 강한 중기 추세")
+        if psychology >= 10:
+            strengths.append("심리: 과열보다 매집/휴식 구간에 가까움")
+        if asymmetry >= 7:
+            strengths.append("손익비: ATR 손절 대비 목표 구간 양호")
+        if report.accumulation:
+            strengths.append("수급: 외국인/기관 누적 순매수 확인")
+        return strengths or ["복합 팩터 통과"]
+
+    @staticmethod
+    def _concerns(
+        report: DiscoveryReport,
+        quality: float,
+        value: float,
+        momentum: float,
+        psychology: float,
+        asymmetry: float,
+    ) -> List[str]:
+        concerns: List[str] = []
+        if quality < 15:
+            concerns.append("품질 점수 낮음")
+        if value < 13:
+            concerns.append("가격 매력 제한")
+        if momentum < 14:
+            concerns.append("중기 모멘텀 약함")
+        if psychology < 9:
+            concerns.append("단기 과열 또는 심리 리스크")
+        if asymmetry < 6:
+            concerns.append("목표 대비 손절폭 부담")
+        if report.technicals.high_proximity_180d > 100:
+            concerns.append("180일 신고가권 돌파 후 변동성 주의")
+        return concerns
+
+    @staticmethod
+    def _label(total: float) -> str:
+        if total >= 82:
+            return "복합 알파 우수"
+        if total >= 72:
+            return "우량 후보"
+        if total >= 64:
+            return "관심 후보"
+        return "보류"
 
 
 class DecisionPolicy:
@@ -2117,25 +2345,10 @@ class DecisionPolicy:
             AUTO_TRADE_MIN_RISK_SCORE,
             {"conservative": 15.0, "institutional": 13.0, "balanced": 12.0, "aggressive": 10.0},
         )
-        self.min_financial_score = env_float_profile(
-            "AUTO_TRADE_MIN_FINANCIAL_SCORE",
-            AUTO_TRADE_MIN_FINANCIAL_SCORE,
-            {"conservative": 22.0, "institutional": 20.0, "balanced": 18.0, "aggressive": 16.0},
-        )
-        self.min_accumulation_score = env_float_profile(
-            "AUTO_TRADE_MIN_ACCUMULATION_SCORE",
-            AUTO_TRADE_MIN_ACCUMULATION_SCORE,
-            {"conservative": 15.0, "institutional": 12.0, "balanced": 10.0, "aggressive": 8.0},
-        )
-        self.min_technical_score = env_float_profile(
-            "AUTO_TRADE_MIN_TECHNICAL_SCORE",
-            AUTO_TRADE_MIN_TECHNICAL_SCORE,
-            {"conservative": 18.0, "institutional": 17.0, "balanced": 15.0, "aggressive": 13.0},
-        )
-        self.min_risk_score = env_float_profile(
-            "AUTO_TRADE_MIN_RISK_SCORE",
-            AUTO_TRADE_MIN_RISK_SCORE,
-            {"conservative": 15.0, "institutional": 13.0, "balanced": 12.0, "aggressive": 10.0},
+        self.min_thesis_score = env_float_profile(
+            "MIN_INVESTMENT_THESIS_SCORE",
+            MIN_INVESTMENT_THESIS_SCORE,
+            {"conservative": 76.0, "institutional": 70.0, "balanced": 66.0, "aggressive": 60.0},
         )
         self.min_relative_strength = env_float_profile(
             "MIN_RELATIVE_STRENGTH_60D",
@@ -2164,6 +2377,10 @@ class DecisionPolicy:
             vetoes.append(f"데이터 신뢰도 {report.data_quality_score:.1f} < {self.min_data_quality:.1f}")
         if score.total < self.min_factor_score:
             vetoes.append(f"종합점수 {score.total:.1f} < {self.min_factor_score:.1f}")
+        if report.thesis is None:
+            vetoes.append("투자 가설 점수 없음")
+        elif report.thesis.total < self.min_thesis_score:
+            vetoes.append(f"투자 가설 {report.thesis.total:.1f} < {self.min_thesis_score:.1f}")
         if technicals.relative_strength_60d < self.min_relative_strength:
             vetoes.append(f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p 미달")
         if technicals.return_20d < self.min_return_20d:
@@ -2181,6 +2398,8 @@ class DecisionPolicy:
             f"상대강도 {technicals.relative_strength_60d:+.1f}%p",
             f"손절폭 {stop_loss_pct:.1f}%",
         ]
+        if report.thesis is not None:
+            reasons.insert(1, f"가설 {report.thesis.total:.1f}/{report.thesis.label}")
         if report.accumulation is not None:
             reasons.append(f"수급 {report.accumulation.net_buy_ratio * 100:.2f}%")
 
@@ -2236,6 +2455,10 @@ class DecisionPolicy:
             vetoes.append(f"기술점수 {score.technical:.1f} < {self.min_technical_score:.1f}")
         if score.risk < self.min_risk_score:
             vetoes.append(f"리스크점수 {score.risk:.1f} < {self.min_risk_score:.1f}")
+        if report.thesis is None:
+            vetoes.append("투자 가설 점수 없음")
+        elif report.thesis.total < self.min_thesis_score:
+            vetoes.append(f"투자 가설 {report.thesis.total:.1f} < {self.min_thesis_score:.1f}")
         return vetoes
 
     @staticmethod
@@ -2712,6 +2935,7 @@ class RealtimeScanner:
                 data_quality_score=report.data_quality_score,
                 data_quality_grade=report.data_quality_grade,
                 data_quality_warnings=report.data_quality_warnings,
+                thesis=report.thesis,
                 decision=report.decision,
             )
             for report in ranked
@@ -2799,6 +3023,11 @@ class RealtimeScanner:
                         data_quality_score=data_quality_score,
                         data_quality_grade=str(item.get("data_quality_grade", "N/A")),
                         data_quality_warnings=list(item.get("data_quality_warnings") or []),
+                        thesis=(
+                            InvestmentThesis(**item["thesis"])
+                            if isinstance(item.get("thesis"), dict)
+                            else None
+                        ),
                         decision=(
                             SignalDecision(**item["decision"])
                             if isinstance(item.get("decision"), dict)
@@ -2821,9 +3050,11 @@ class RealtimeScanner:
             f"⏱️ 감시 시간: {self.scan_start}~{self.scan_end}, {self.scan_interval_seconds}초 간격",
         ]
         for report in FinancialHealthBot._rank_reports(reports)[: min(5, self.max_watchlist)]:
+            thesis_text = f"가설 {report.thesis.total:.1f}({report.thesis.label})" if report.thesis else "가설 N/A"
             lines.append(
                 f"- {report.stock.name}({report.stock.code}) "
                 f"{format_factor_score(report.score)}, PBR {report.financials.pbr:.2f}, "
+                f"{thesis_text}, "
                 f"{report.decision.tier if report.decision else '판단 N/A'}, "
                 f"DQ {report.data_quality_score:.1f}, "
                 f"RSI {report.technicals.rsi:.1f}, "
@@ -2940,6 +3171,7 @@ class RealtimeScanner:
             f"💎 [{candidate.stock.name}({candidate.stock.code})]\n"
             f"🛡️ 시장 국면: {signal.market_regime.summary} / Risk-On\n"
             f"⭐ 종합점수: {format_factor_score(candidate.score)}\n"
+            f"🧠 투자 가설: {format_investment_thesis(candidate.thesis)}\n"
             f"🧭 의사결정: {format_signal_decision(candidate.decision)}\n"
             f"🧾 데이터 신뢰도: {format_data_quality(candidate.data_quality_score, candidate.data_quality_grade, candidate.data_quality_warnings)}\n"
             f"💵 현재가: {signal.current_price:,.0f}원 ({signal.change_rate:+.2f}%)\n"
@@ -2949,7 +3181,8 @@ class RealtimeScanner:
             f"ROE {format_optional_percent(financials.roe)}\n"
             f"📌 기준: RSI {technicals.rsi:.1f}, 20일선 {technicals.ma20:,.0f}원, "
             f"거래량 페이스 {signal.volume_pace_ratio:.1f}배, "
-            f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p\n"
+            f"60일 상대강도 {technicals.relative_strength_60d:+.1f}%p, "
+            f"손익비 {technicals.risk_reward_ratio:.2f}\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원\n"
             f"🏦 수급: {format_accumulation(candidate.accumulation)}\n"
             f"💡 {candidate.reason}"
@@ -2987,6 +3220,7 @@ class FinancialHealthBot:
         self.technical_analyzer = TechnicalAnalyzer(self.kis_provider)
         self.accumulation_analyzer = AccumulationAnalyzer()
         self.factor_scorer = FactorScorer()
+        self.thesis_builder = InvestmentThesisBuilder()
         self.decision_policy = DecisionPolicy()
         self.notifier = Notifier(token=token, chat_id=chat_id)
         self.trading_engine = TradingEngine(self.kis_provider, self.notifier)
@@ -3112,6 +3346,18 @@ class FinancialHealthBot:
                     report.score.total,
                 )
                 continue
+            report.thesis = self.thesis_builder.build(report)
+            if (
+                env_bool("ENABLE_INVESTMENT_THESIS_FILTER", ENABLE_INVESTMENT_THESIS_FILTER)
+                and report.thesis.total < investment_thesis_minimum()
+            ):
+                logger.debug(
+                    "%s(%s) 투자 가설 %.1f 미달",
+                    report.stock.name,
+                    report.stock.code,
+                    report.thesis.total,
+                )
+                continue
             report.decision = self.decision_policy.classify(report)
             if report.decision.tier == "보류":
                 logger.debug(
@@ -3153,6 +3399,7 @@ class FinancialHealthBot:
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
             f"💎 [{report.stock.name}({report.stock.code})]\n"
             f"⭐ 종합점수: {format_factor_score(report.score)}\n"
+            f"🧠 투자 가설: {format_investment_thesis(report.thesis)}\n"
             f"🧭 의사결정: {format_signal_decision(report.decision)}\n"
             f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}\n"
             f"💰 시가총액: {format_market_cap(financials.market_cap)}\n"
@@ -3163,7 +3410,8 @@ class FinancialHealthBot:
             f"📈 타점: {technicals.trend_summary} "
             f"(현재가 {technicals.current_price:,.0f}원, RSI {technicals.rsi:.1f})\n"
             f"🚀 상대강도: 60일 {technicals.relative_strength_60d:+.1f}%p, "
-            f"20일 수익률 {technicals.return_20d:+.1f}%\n"
+            f"20일 수익률 {technicals.return_20d:+.1f}%, "
+            f"120~20일 모멘텀 {technicals.momentum_120_20d:+.1f}%\n"
             f"🛡️ 손절선: {technicals.stop_loss:,.0f}원 "
             f"(ATR {technicals.atr:,.0f}원 기준)\n"
             f"🏦 수급: {format_accumulation(report.accumulation)}\n"
@@ -3197,6 +3445,7 @@ class FinancialHealthBot:
             key=lambda report: (
                 decision_rank(report.decision),
                 -(1 if report.decision and report.decision.trade_eligible else 0),
+                -(report.thesis.total if report.thesis else 0.0),
                 -(report.score.total if report.score else 0.0),
                 -report.data_quality_score,
                 -((report.accumulation.net_buy_amount_to_market_cap if report.accumulation and report.accumulation.net_buy_amount_to_market_cap else 0.0)),
@@ -3214,7 +3463,9 @@ class FinancialHealthBot:
         return (
             f"부채비율 {metrics.debt_to_equity:.1f}%와 유동비율 {metrics.current_ratio:.1f}%로 재무 안정성이 높고, "
             f"PBR {metrics.pbr:.2f}로 자산가치 대비 저평가 구간입니다. "
-            f"{margin_text}, 시장보다 낮은 변동성과 {technicals.trend_summary}입니다."
+            f"{margin_text}, 120~20일 중기 모멘텀 {technicals.momentum_120_20d:+.1f}%와 "
+            f"180일 고점 근접도 {technicals.high_proximity_180d:.1f}%로 추세 지속성을 확인했고, "
+            f"목표/손절 손익비는 {technicals.risk_reward_ratio:.2f}입니다."
         )
 
     @staticmethod
@@ -3249,6 +3500,7 @@ class FinancialHealthBot:
                     "",
                     f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
                     f"⭐ 종합점수: {format_factor_score(report.score)}",
+                    f"🧠 투자 가설: {format_investment_thesis(report.thesis)}",
                     f"🧭 의사결정: {format_signal_decision(report.decision)}",
                     f"🧾 데이터 신뢰도: {format_data_quality(report.data_quality_score, report.data_quality_grade, report.data_quality_warnings)}",
                     f"💰 시가총액: {format_market_cap(financials.market_cap)}",
@@ -3282,6 +3534,12 @@ class FinancialHealthBot:
                         f"60일 {technicals.return_60d:+.1f}%, "
                         f"120일 {technicals.return_120d:+.1f}%, "
                         f"60일 최대낙폭 {technicals.max_drawdown_60d:.1f}%"
+                    ),
+                    (
+                        "🧭 중기 구조: "
+                        f"120~20일 모멘텀 {technicals.momentum_120_20d:+.1f}%, "
+                        f"180일 고점 근접도 {technicals.high_proximity_180d:.1f}%, "
+                        f"목표/손절 손익비 {technicals.risk_reward_ratio:.2f}"
                     ),
                     (
                         "🛡️ 리스크 관리: "
@@ -3413,6 +3671,21 @@ def format_factor_score(score: Optional[FactorScore]) -> str:
     )
 
 
+def format_investment_thesis(thesis: Optional[InvestmentThesis]) -> str:
+    if thesis is None:
+        return "N/A"
+    text = (
+        f"{thesis.total:.1f}/100({thesis.label}) "
+        f"[품질 {thesis.quality:.1f}, 가치 {thesis.value:.1f}, 모멘텀 {thesis.momentum:.1f}, "
+        f"심리 {thesis.psychology:.1f}, 손익비 {thesis.asymmetry:.1f}]"
+    )
+    if thesis.strengths:
+        text += " / 강점: " + " · ".join(thesis.strengths[:2])
+    if thesis.concerns:
+        text += " / 주의: " + " · ".join(thesis.concerns[:2])
+    return text
+
+
 def decision_rank(decision: Optional[SignalDecision]) -> int:
     if decision is None:
         return 9
@@ -3521,6 +3794,14 @@ def factor_score_minimum() -> float:
     )
 
 
+def investment_thesis_minimum() -> float:
+    return env_float_profile(
+        "MIN_INVESTMENT_THESIS_SCORE",
+        MIN_INVESTMENT_THESIS_SCORE,
+        {"conservative": 76.0, "institutional": 70.0, "balanced": 66.0, "aggressive": 60.0},
+    )
+
+
 def data_quality_min_score() -> float:
     return env_float_profile(
         "MIN_DATA_QUALITY_SCORE",
@@ -3622,6 +3903,17 @@ def return_over_period(close: pd.Series, days: int) -> float:
     if previous <= 0:
         return 0.0
     return (current / previous - 1) * 100
+
+
+def return_between_periods(close: pd.Series, start_days_ago: int, end_days_ago: int) -> float:
+    values = close.dropna().astype(float)
+    if start_days_ago <= end_days_ago or len(values) <= start_days_ago:
+        return 0.0
+    start_value = float(values.iloc[-start_days_ago - 1])
+    end_value = float(values.iloc[-end_days_ago - 1])
+    if start_value <= 0:
+        return 0.0
+    return (end_value / start_value - 1) * 100
 
 
 def max_drawdown(close: pd.Series) -> float:

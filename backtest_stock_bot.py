@@ -24,12 +24,16 @@ from stock_telegram_bot import (
     MARKETS,
     MAX_DISTANCE_ABOVE_MA20,
     MAX_DRAWDOWN_60D,
+    MAX_HIGH_PROXIMITY_180D,
     MAX_RETURN_120D,
     MAX_RETURN_20D,
     MIN_DAILY_TRADING_VALUE,
     MIN_HISTORY_DAYS,
     MIN_MARKET_CAP,
+    MIN_HIGH_PROXIMITY_180D,
+    MIN_INTERMEDIATE_MOMENTUM_120_20D,
     MIN_RELATIVE_STRENGTH_60D,
+    MIN_RISK_REWARD_RATIO,
     MIN_RETURN_20D,
     MIN_RSI,
     RSI_WINDOW,
@@ -40,6 +44,7 @@ from stock_telegram_bot import (
     env_float,
     env_float_profile,
     max_drawdown,
+    return_between_periods,
     return_over_period,
 )
 
@@ -75,6 +80,9 @@ class BacktestTrade:
     relative_strength_60d: float
     return_20d: float
     max_drawdown_60d: float
+    momentum_120_20d: float
+    high_proximity_180d: float
+    risk_reward_ratio: float
     return_pct: float
     holding_days: int
     exit_reason: str
@@ -211,6 +219,22 @@ class StrategyBacktester:
         max_return_20d = env_float("MAX_RETURN_20D", MAX_RETURN_20D)
         max_return_120d = env_float("MAX_RETURN_120D", MAX_RETURN_120D)
         max_drawdown_60d_limit = env_float("MAX_DRAWDOWN_60D", MAX_DRAWDOWN_60D)
+        min_intermediate_momentum = env_float_profile(
+            "MIN_INTERMEDIATE_MOMENTUM_120_20D",
+            MIN_INTERMEDIATE_MOMENTUM_120_20D,
+            {"conservative": 0.0, "institutional": -2.0, "balanced": -5.0, "aggressive": -10.0},
+        )
+        min_high_proximity = env_float_profile(
+            "MIN_HIGH_PROXIMITY_180D",
+            MIN_HIGH_PROXIMITY_180D,
+            {"conservative": 72.0, "institutional": 68.0, "balanced": 65.0, "aggressive": 58.0},
+        )
+        max_high_proximity = env_float("MAX_HIGH_PROXIMITY_180D", MAX_HIGH_PROXIMITY_180D)
+        min_risk_reward_ratio = env_float_profile(
+            "MIN_RISK_REWARD_RATIO",
+            MIN_RISK_REWARD_RATIO,
+            {"conservative": 1.35, "institutional": 1.15, "balanced": 1.0, "aggressive": 0.8},
+        )
         trades: List[BacktestTrade] = []
         i = max(MA_LONG, MARKET_REGIME_MA)
 
@@ -238,11 +262,25 @@ class StrategyBacktester:
             market_return_60d = return_over_period(market_close_until_now, 60)
             relative_strength_60d = return_60d - market_return_60d
             drawdown_60d = max_drawdown(close_until_now.tail(60))
+            momentum_120_20d = return_between_periods(close_until_now, 120, 20)
+            high_window = close_until_now.tail(min(len(close_until_now), 180))
+            high_180d = float(high_window.max()) if not high_window.empty else current_price
+            high_proximity_180d = current_price / high_180d * 100 if high_180d > 0 else 0.0
+            target_price = max(high_180d, ma20 + float(row["ATR"]) * 3.0)
+            stop_loss_candidate = max(0.0, current_price - ATR_STOP_MULTIPLIER * float(row["ATR"]))
+            downside = max(current_price - stop_loss_candidate, 1.0)
+            risk_reward_ratio = max(0.0, (target_price - current_price) / downside)
             return_quality_signal = (
                 return_20d >= min_return_20d
                 and return_20d <= max_return_20d
                 and return_120d <= max_return_120d
                 and drawdown_60d <= max_drawdown_60d_limit
+            )
+            momentum_durability_signal = (
+                momentum_120_20d >= min_intermediate_momentum
+                and high_proximity_180d >= min_high_proximity
+                and high_proximity_180d <= max_high_proximity
+                and risk_reward_ratio >= min_risk_reward_ratio
             )
 
             entry_signal = (
@@ -253,6 +291,7 @@ class StrategyBacktester:
                 and volume_ratio >= self.config.min_volume_ratio
                 and relative_strength_60d >= min_relative_strength
                 and return_quality_signal
+                and momentum_durability_signal
             )
             if not entry_signal:
                 i += 1
@@ -280,6 +319,9 @@ class StrategyBacktester:
                     relative_strength_60d=round(relative_strength_60d, 2),
                     return_20d=round(return_20d, 2),
                     max_drawdown_60d=round(drawdown_60d, 2),
+                    momentum_120_20d=round(momentum_120_20d, 2),
+                    high_proximity_180d=round(high_proximity_180d, 2),
+                    risk_reward_ratio=round(risk_reward_ratio, 2),
                     return_pct=round(return_pct, 2),
                     holding_days=holding_days,
                     exit_reason=exit_reason,
@@ -333,6 +375,12 @@ class StrategyBacktester:
             ),
             "avg_entry_return_20d_pct": round(sum(trade.return_20d for trade in trades) / len(trades), 2),
             "avg_entry_drawdown_60d_pct": round(sum(trade.max_drawdown_60d for trade in trades) / len(trades), 2),
+            "avg_intermediate_momentum_120_20d_pct": round(
+                sum(trade.momentum_120_20d for trade in trades) / len(trades),
+                2,
+            ),
+            "avg_high_proximity_180d_pct": round(sum(trade.high_proximity_180d for trade in trades) / len(trades), 2),
+            "avg_entry_risk_reward_ratio": round(sum(trade.risk_reward_ratio for trade in trades) / len(trades), 2),
         }
 
     def _save_results(self, trades: List[BacktestTrade], summary: Dict[str, object]) -> None:

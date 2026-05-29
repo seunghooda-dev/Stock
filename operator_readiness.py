@@ -32,6 +32,7 @@ from stock_telegram_bot import (
     env_float,
     factor_score_minimum,
     format_market_cap,
+    investment_thesis_minimum,
     mask_account,
     normalize_trading_env,
 )
@@ -210,7 +211,11 @@ class OperatorReadinessAuditor:
         self._pass(
             "Policy",
             "Alert gate",
-            f"최소점수 {factor_score_minimum():.1f}, 최소 데이터 신뢰도 {data_quality_min_score():.1f}",
+            (
+                f"최소점수 {factor_score_minimum():.1f}, "
+                f"투자 가설 {investment_thesis_minimum():.1f}, "
+                f"최소 데이터 신뢰도 {data_quality_min_score():.1f}"
+            ),
         )
         self._pass(
             "Policy",
@@ -414,6 +419,7 @@ class OperatorReadinessAuditor:
             "strategy_profile": active_strategy_profile(),
             "target": self.target,
             "min_factor_score": factor_score_minimum(),
+            "min_investment_thesis_score": investment_thesis_minimum(),
             "min_data_quality": data_quality_min_score(),
             "strong_buy_score": policy.strong_buy_score,
             "auto_trade_min_score": policy.trade_ready_score,
