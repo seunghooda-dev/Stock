@@ -196,6 +196,10 @@ WATCHLIST_MIN_ROE = 0.0
 WATCHLIST_MIN_OPERATING_MARGIN = 0.0
 WATCHLIST_MIN_REVENUE_GROWTH_YOY = -20.0
 WATCHLIST_MIN_OPERATING_INCOME_GROWTH_YOY = -50.0
+RADAR_ENABLED = True
+RADAR_MIN_FACTOR_SCORE = 35.0
+RADAR_MIN_INVESTMENT_THESIS_SCORE = 35.0
+RADAR_MIN_DATA_QUALITY_SCORE = 50.0
 
 # Technical filters
 RSI_WINDOW = 14
@@ -231,6 +235,19 @@ WATCHLIST_MAX_DRAWDOWN_60D = 40.0
 WATCHLIST_MIN_INTERMEDIATE_MOMENTUM_120_20D = -25.0
 WATCHLIST_MIN_HIGH_PROXIMITY_180D = 45.0
 WATCHLIST_MIN_RISK_REWARD_RATIO = 0.50
+RADAR_MIN_RSI = 20.0
+RADAR_MAX_RSI = 80.0
+RADAR_MA_SUPPORT_BAND = 0.25
+RADAR_MAX_DISTANCE_ABOVE_MA20 = 0.40
+RADAR_MAX_RELATIVE_VOLATILITY = 2.50
+RADAR_MIN_RELATIVE_STRENGTH_60D = -20.0
+RADAR_MIN_RETURN_20D = -35.0
+RADAR_MAX_RETURN_20D = 80.0
+RADAR_MAX_RETURN_120D = 250.0
+RADAR_MAX_DRAWDOWN_60D = 65.0
+RADAR_MIN_INTERMEDIATE_MOMENTUM_120_20D = -60.0
+RADAR_MIN_HIGH_PROXIMITY_180D = 20.0
+RADAR_MIN_RISK_REWARD_RATIO = 0.10
 
 # Real-order gates are stricter than alert gates.
 AUTO_TRADE_MIN_SCORE = 80.0
@@ -2117,6 +2134,21 @@ class TechnicalAnalyzer:
                 high_proximity_180d=high_proximity_180d,
                 risk_reward_ratio=risk_reward_ratio,
             )
+            radar_passed = self._radar_technical_passed(
+                current_price=current_price,
+                ma20=ma20,
+                ma60=ma60,
+                rsi=rsi,
+                volatility=volatility,
+                market_regime=market_regime,
+                relative_strength_60d=relative_strength_60d,
+                return_20d=return_20d,
+                return_120d=return_120d,
+                max_drawdown_60d=max_drawdown_60d,
+                momentum_120_20d=momentum_120_20d,
+                high_proximity_180d=high_proximity_180d,
+                risk_reward_ratio=risk_reward_ratio,
+            )
 
             normalized_mode = mode.strip().lower()
             signal_stage = "strict"
@@ -2132,6 +2164,8 @@ class TechnicalAnalyzer:
                     signal_stage = "strict"
                 elif watchlist_enabled() and watchlist_passed:
                     signal_stage = "watchlist"
+                elif radar_enabled() and radar_passed:
+                    signal_stage = "radar"
                 else:
                     return None
             else:
@@ -2143,7 +2177,9 @@ class TechnicalAnalyzer:
                 elif ma20 <= ma60:
                     trend_summary = "관찰 후보: 20일선 회복, 60일선 전환 확인 필요"
                 else:
-                    trend_summary = "관찰 후보: RSI 35~60 구간에서 추세 개선 감시"
+                    trend_summary = "관찰 후보: RSI 30~65 구간에서 추세 개선 감시"
+            elif signal_stage == "radar":
+                trend_summary = "레이더 후보: 조건 미성숙, 가격/거래량 회복 여부 추적"
             else:
                 crossed_ma20 = float(previous["Close"]) <= float(previous["MA20"]) and current_price > ma20
                 if crossed_ma20:
@@ -2152,6 +2188,8 @@ class TechnicalAnalyzer:
                     trend_summary = "RSI 40~55 구간에서 20일선 지지 확인"
 
             if signal_stage == "watchlist" and not watchlist_enabled():
+                return None
+            if signal_stage == "radar" and not radar_enabled():
                 return None
 
             return TechnicalSnapshot(
@@ -2258,6 +2296,49 @@ class TechnicalAnalyzer:
             and return_quality_ok
             and momentum_ok
         )
+
+    @staticmethod
+    def _radar_technical_passed(
+        current_price: float,
+        ma20: float,
+        ma60: float,
+        rsi: float,
+        volatility: float,
+        market_regime: MarketRegime,
+        relative_strength_60d: float,
+        return_20d: float,
+        return_120d: float,
+        max_drawdown_60d: float,
+        momentum_120_20d: float,
+        high_proximity_180d: float,
+        risk_reward_ratio: float,
+    ) -> bool:
+        if ma20 <= 0 or ma60 <= 0:
+            return False
+        price_near_ma20 = (
+            ma20 * (1 - env_float("RADAR_MA_SUPPORT_BAND", RADAR_MA_SUPPORT_BAND))
+            <= current_price
+            <= ma20 * (1 + env_float("RADAR_MAX_DISTANCE_ABOVE_MA20", RADAR_MAX_DISTANCE_ABOVE_MA20))
+        )
+        rsi_zone = env_float("RADAR_MIN_RSI", RADAR_MIN_RSI) <= rsi <= env_float("RADAR_MAX_RSI", RADAR_MAX_RSI)
+        market_volatility = market_regime.volatility or 0.0
+        volatility_ok = (
+            market_volatility <= 0
+            or volatility <= market_volatility * env_float("RADAR_MAX_RELATIVE_VOLATILITY", RADAR_MAX_RELATIVE_VOLATILITY)
+        )
+        return_quality_ok = (
+            return_20d >= env_float("RADAR_MIN_RETURN_20D", RADAR_MIN_RETURN_20D)
+            and return_20d <= env_float("RADAR_MAX_RETURN_20D", RADAR_MAX_RETURN_20D)
+            and return_120d <= env_float("RADAR_MAX_RETURN_120D", RADAR_MAX_RETURN_120D)
+            and max_drawdown_60d <= env_float("RADAR_MAX_DRAWDOWN_60D", RADAR_MAX_DRAWDOWN_60D)
+        )
+        momentum_ok = (
+            relative_strength_60d >= radar_relative_strength_minimum()
+            and momentum_120_20d >= env_float("RADAR_MIN_INTERMEDIATE_MOMENTUM_120_20D", RADAR_MIN_INTERMEDIATE_MOMENTUM_120_20D)
+            and high_proximity_180d >= env_float("RADAR_MIN_HIGH_PROXIMITY_180D", RADAR_MIN_HIGH_PROXIMITY_180D)
+            and risk_reward_ratio >= env_float("RADAR_MIN_RISK_REWARD_RATIO", RADAR_MIN_RISK_REWARD_RATIO)
+        )
+        return price_near_ma20 and rsi_zone and volatility_ok and return_quality_ok and momentum_ok
 
     def _fetch_price_data(self, code: str) -> tuple[pd.DataFrame, DataQualityReport]:
         if self.kis_provider.enabled and env_bool("KIS_DAILY_PRICE_ENABLED", KIS_DAILY_PRICE_ENABLED):
@@ -2594,6 +2675,8 @@ class DecisionPolicy:
         self.min_data_quality = data_quality_min_score()
         self.watchlist_min_factor_score = watchlist_factor_score_minimum()
         self.watchlist_min_data_quality = watchlist_data_quality_min_score()
+        self.radar_min_factor_score = radar_factor_score_minimum()
+        self.radar_min_data_quality = radar_data_quality_min_score()
         self.strong_buy_score = env_float_profile(
             "SIGNAL_STRONG_BUY_SCORE",
             SIGNAL_STRONG_BUY_SCORE,
@@ -2640,12 +2723,14 @@ class DecisionPolicy:
             {"conservative": 76.0, "institutional": 70.0, "balanced": 66.0, "aggressive": 60.0},
         )
         self.watchlist_min_thesis_score = watchlist_investment_thesis_minimum()
+        self.radar_min_thesis_score = radar_investment_thesis_minimum()
         self.min_relative_strength = env_float_profile(
             "MIN_RELATIVE_STRENGTH_60D",
             MIN_RELATIVE_STRENGTH_60D,
             {"conservative": 3.0, "institutional": 1.0, "balanced": 0.0, "aggressive": -3.0},
         )
         self.watchlist_min_relative_strength = watchlist_relative_strength_minimum()
+        self.radar_min_relative_strength = radar_relative_strength_minimum()
         self.min_return_20d = env_float("MIN_RETURN_20D", MIN_RETURN_20D)
         self.max_return_20d = env_float("MAX_RETURN_20D", MAX_RETURN_20D)
         self.max_return_120d = env_float("MAX_RETURN_120D", MAX_RETURN_120D)
@@ -2654,6 +2739,10 @@ class DecisionPolicy:
         self.watchlist_max_return_20d = env_float("WATCHLIST_MAX_RETURN_20D", WATCHLIST_MAX_RETURN_20D)
         self.watchlist_max_return_120d = env_float("WATCHLIST_MAX_RETURN_120D", WATCHLIST_MAX_RETURN_120D)
         self.watchlist_max_drawdown_60d = env_float("WATCHLIST_MAX_DRAWDOWN_60D", WATCHLIST_MAX_DRAWDOWN_60D)
+        self.radar_min_return_20d = env_float("RADAR_MIN_RETURN_20D", RADAR_MIN_RETURN_20D)
+        self.radar_max_return_20d = env_float("RADAR_MAX_RETURN_20D", RADAR_MAX_RETURN_20D)
+        self.radar_max_return_120d = env_float("RADAR_MAX_RETURN_120D", RADAR_MAX_RETURN_120D)
+        self.radar_max_drawdown_60d = env_float("RADAR_MAX_DRAWDOWN_60D", RADAR_MAX_DRAWDOWN_60D)
 
     def classify(self, report: DiscoveryReport) -> SignalDecision:
         if report.score is None:
@@ -2667,15 +2756,35 @@ class DecisionPolicy:
         score = report.score
         technicals = report.technicals
         stop_loss_pct = self._stop_loss_pct(technicals)
+        is_radar = report.signal_stage == "radar" or technicals.signal_stage == "radar"
         is_watchlist = report.signal_stage == "watchlist" or technicals.signal_stage == "watchlist"
-        min_data_quality = self.watchlist_min_data_quality if is_watchlist else self.min_data_quality
-        min_factor_score = self.watchlist_min_factor_score if is_watchlist else self.min_factor_score
-        min_thesis_score = self.watchlist_min_thesis_score if is_watchlist else self.min_thesis_score
-        min_relative_strength = self.watchlist_min_relative_strength if is_watchlist else self.min_relative_strength
-        min_return_20d = self.watchlist_min_return_20d if is_watchlist else self.min_return_20d
-        max_return_20d = self.watchlist_max_return_20d if is_watchlist else self.max_return_20d
-        max_return_120d = self.watchlist_max_return_120d if is_watchlist else self.max_return_120d
-        max_drawdown_60d = self.watchlist_max_drawdown_60d if is_watchlist else self.max_drawdown_60d
+        if is_radar:
+            min_data_quality = self.radar_min_data_quality
+            min_factor_score = self.radar_min_factor_score
+            min_thesis_score = self.radar_min_thesis_score
+            min_relative_strength = self.radar_min_relative_strength
+            min_return_20d = self.radar_min_return_20d
+            max_return_20d = self.radar_max_return_20d
+            max_return_120d = self.radar_max_return_120d
+            max_drawdown_60d = self.radar_max_drawdown_60d
+        elif is_watchlist:
+            min_data_quality = self.watchlist_min_data_quality
+            min_factor_score = self.watchlist_min_factor_score
+            min_thesis_score = self.watchlist_min_thesis_score
+            min_relative_strength = self.watchlist_min_relative_strength
+            min_return_20d = self.watchlist_min_return_20d
+            max_return_20d = self.watchlist_max_return_20d
+            max_return_120d = self.watchlist_max_return_120d
+            max_drawdown_60d = self.watchlist_max_drawdown_60d
+        else:
+            min_data_quality = self.min_data_quality
+            min_factor_score = self.min_factor_score
+            min_thesis_score = self.min_thesis_score
+            min_relative_strength = self.min_relative_strength
+            min_return_20d = self.min_return_20d
+            max_return_20d = self.max_return_20d
+            max_return_120d = self.max_return_120d
+            max_drawdown_60d = self.max_drawdown_60d
         vetoes: List[str] = []
         if report.data_quality_score < min_data_quality:
             vetoes.append(f"데이터 신뢰도 {report.data_quality_score:.1f} < {min_data_quality:.1f}")
@@ -2715,6 +2824,16 @@ class DecisionPolicy:
                 trade_eligible=False,
                 reasons=reasons,
                 vetoes=vetoes[:5],
+            )
+
+        if is_radar:
+            trade_vetoes = self._trade_vetoes(report, stop_loss_pct)
+            return SignalDecision(
+                tier="레이더 후보",
+                action="리서치 전용, 매수 금지",
+                trade_eligible=False,
+                reasons=reasons,
+                vetoes=(["레이더 단계는 자동매매 제외"] + trade_vetoes)[:5],
             )
 
         if is_watchlist:
@@ -2939,11 +3058,12 @@ class TradingEngine:
 
     def _passes_auto_trade_gate(self, report: DiscoveryReport) -> bool:
         score = report.score.total if report.score else 0.0
-        if report.signal_stage == "watchlist" or report.technicals.signal_stage == "watchlist":
+        if report.signal_stage != "strict" or report.technicals.signal_stage != "strict":
             logger.info(
-                "%s(%s) 관찰 후보 단계이므로 자동매매 제외",
+                "%s(%s) %s 단계이므로 자동매매 제외",
                 report.stock.name,
                 report.stock.code,
+                format_discovery_stage(report.signal_stage),
             )
             return False
         if report.decision and not report.decision.trade_eligible:
@@ -3340,7 +3460,9 @@ class RealtimeScanner:
                 data_quality_score = float(item.get("data_quality_score", 0.0))
                 signal_stage = str(item.get("signal_stage", "strict"))
                 required_quality = (
-                    watchlist_data_quality_min_score()
+                    radar_data_quality_min_score()
+                    if signal_stage == "radar"
+                    else watchlist_data_quality_min_score()
                     if signal_stage == "watchlist"
                     else data_quality_min_score()
                 )
@@ -3391,6 +3513,7 @@ class RealtimeScanner:
             f"🛡️ KOSPI: {regimes['KOSPI'].summary} / Risk-On={regimes['KOSPI'].risk_on}",
             f"🛡️ KOSDAQ: {regimes['KOSDAQ'].summary} / Risk-On={regimes['KOSDAQ'].risk_on}",
             f"⏱️ 감시 시간: {self.scan_start}~{self.scan_end}, {self.scan_interval_seconds}초 간격",
+            "🔢 정렬 기준: 종합점수 높은 순",
         ]
         for report in FinancialHealthBot._rank_reports(reports)[: min(5, self.max_watchlist)]:
             thesis_text = f"가설 {report.thesis.total:.1f}({report.thesis.label})" if report.thesis else "가설 N/A"
@@ -3853,8 +3976,11 @@ class FinancialHealthBot:
         watchlist_min_factor = watchlist_factor_score_minimum()
         watchlist_min_thesis = watchlist_investment_thesis_minimum()
         watchlist_min_quality = watchlist_data_quality_min_score()
+        radar_min_factor = radar_factor_score_minimum()
+        radar_min_thesis = radar_investment_thesis_minimum()
+        radar_min_quality = radar_data_quality_min_score()
         strict_validation = env_bool("STRICT_DATA_VALIDATION", STRICT_DATA_VALIDATION)
-        technical_mode = "tiered" if watchlist_enabled() else "strict"
+        technical_mode = "tiered" if watchlist_enabled() or radar_enabled() else "strict"
         for metrics in financially_strong:
             stock_meta = stock_map.get(metrics.code)
             if stock_meta is None:
@@ -3867,11 +3993,7 @@ class FinancialHealthBot:
             technicals = self.technical_analyzer.analyze(stock_meta, market_regime, mode=technical_mode)
             if technicals is None:
                 continue
-            signal_stage = (
-                "watchlist"
-                if metrics.signal_stage == "watchlist" or technicals.signal_stage == "watchlist"
-                else "strict"
-            )
+            signal_stage = self._combine_signal_stage(metrics.signal_stage, technicals.signal_stage)
             technicals.signal_stage = signal_stage
 
             accumulation = self.accumulation_analyzer.analyze(stock_meta)
@@ -3879,8 +4001,11 @@ class FinancialHealthBot:
                 if signal_stage == "strict" and watchlist_enabled() and not watchlist_requires_smart_money():
                     signal_stage = "watchlist"
                     technicals.signal_stage = signal_stage
-                elif signal_stage == "watchlist" and not watchlist_requires_smart_money():
+                elif signal_stage in {"watchlist", "radar"} and not watchlist_requires_smart_money():
                     pass
+                elif signal_stage == "strict" and radar_enabled():
+                    signal_stage = "radar"
+                    technicals.signal_stage = signal_stage
                 else:
                     continue
 
@@ -3907,7 +4032,22 @@ class FinancialHealthBot:
                 signal_stage = "watchlist"
                 report.signal_stage = signal_stage
                 report.technicals.signal_stage = signal_stage
-            required_quality = watchlist_min_quality if signal_stage == "watchlist" else strict_quality_min
+            if (
+                signal_stage in {"strict", "watchlist"}
+                and radar_enabled()
+                and strict_validation
+                and data_quality.score < (watchlist_min_quality if signal_stage == "watchlist" else strict_quality_min)
+                and data_quality.score >= radar_min_quality
+            ):
+                signal_stage = "radar"
+                report.signal_stage = signal_stage
+                report.technicals.signal_stage = signal_stage
+            if signal_stage == "radar":
+                required_quality = radar_min_quality
+            elif signal_stage == "watchlist":
+                required_quality = watchlist_min_quality
+            else:
+                required_quality = strict_quality_min
             if strict_validation and data_quality.score < required_quality:
                 logger.debug(
                     "%s(%s) %s 데이터 품질 %.1f 미달(기준 %.1f): %s",
@@ -3929,7 +4069,21 @@ class FinancialHealthBot:
                 signal_stage = "watchlist"
                 report.signal_stage = signal_stage
                 report.technicals.signal_stage = signal_stage
-            required_factor_score = watchlist_min_factor if signal_stage == "watchlist" else min_factor_score
+            if (
+                signal_stage in {"strict", "watchlist"}
+                and radar_enabled()
+                and report.score.total < (watchlist_min_factor if signal_stage == "watchlist" else min_factor_score)
+                and report.score.total >= radar_min_factor
+            ):
+                signal_stage = "radar"
+                report.signal_stage = signal_stage
+                report.technicals.signal_stage = signal_stage
+            if signal_stage == "radar":
+                required_factor_score = radar_min_factor
+            elif signal_stage == "watchlist":
+                required_factor_score = watchlist_min_factor
+            else:
+                required_factor_score = min_factor_score
             if report.score.total < required_factor_score:
                 logger.debug(
                     "%s(%s) %s 팩터 점수 %.1f 미달(기준 %.1f)",
@@ -3951,7 +4105,21 @@ class FinancialHealthBot:
                 signal_stage = "watchlist"
                 report.signal_stage = signal_stage
                 report.technicals.signal_stage = signal_stage
-            required_thesis_score = watchlist_min_thesis if signal_stage == "watchlist" else strict_thesis_min
+            if (
+                signal_stage in {"strict", "watchlist"}
+                and radar_enabled()
+                and report.thesis.total < (watchlist_min_thesis if signal_stage == "watchlist" else strict_thesis_min)
+                and report.thesis.total >= radar_min_thesis
+            ):
+                signal_stage = "radar"
+                report.signal_stage = signal_stage
+                report.technicals.signal_stage = signal_stage
+            if signal_stage == "radar":
+                required_thesis_score = radar_min_thesis
+            elif signal_stage == "watchlist":
+                required_thesis_score = watchlist_min_thesis
+            else:
+                required_thesis_score = strict_thesis_min
             if (
                 env_bool("ENABLE_INVESTMENT_THESIS_FILTER", ENABLE_INVESTMENT_THESIS_FILTER)
                 and report.thesis.total < required_thesis_score
@@ -3980,7 +4148,23 @@ class FinancialHealthBot:
 
         return reports, regimes
 
+    @staticmethod
+    def _combine_signal_stage(*stages: str) -> str:
+        priority = {"radar": 2, "watchlist": 1, "strict": 0}
+        clean_stages = [stage for stage in stages if stage in priority]
+        if not clean_stages:
+            return "strict"
+        return max(clean_stages, key=lambda stage: priority[stage])
+
     def _send_immediate_alert_if_needed(self, report: DiscoveryReport, market_regime: MarketRegime) -> None:
+        if report.signal_stage == "radar":
+            logger.debug(
+                "%s(%s) 레이더 후보는 최종 리포트에만 포함",
+                report.stock.name,
+                report.stock.code,
+            )
+            return
+
         cache_key = report.stock.code
         cached_at_text = self.alert_cache.get(cache_key)
 
@@ -4051,10 +4235,10 @@ class FinancialHealthBot:
         return sorted(
             reports,
             key=lambda report: (
-                decision_rank(report.decision),
-                -(1 if report.decision and report.decision.trade_eligible else 0),
-                -(report.thesis.total if report.thesis else 0.0),
                 -(report.score.total if report.score else 0.0),
+                -(1 if report.decision and report.decision.trade_eligible else 0),
+                decision_rank(report.decision),
+                -(report.thesis.total if report.thesis else 0.0),
                 -report.data_quality_score,
                 -((report.accumulation.net_buy_amount_to_market_cap if report.accumulation and report.accumulation.net_buy_amount_to_market_cap else 0.0)),
                 -((report.accumulation.net_buy_ratio if report.accumulation else 0.0)),
@@ -4097,6 +4281,7 @@ class FinancialHealthBot:
             f"🗓 {today}",
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On",
             f"✅ 최종 발굴 종목 {len(reports)}개",
+            "🔢 정렬 기준: 종합점수 높은 순",
         ]
 
         for report in reports:
@@ -4302,6 +4487,7 @@ def decision_rank(decision: Optional[SignalDecision]) -> int:
         "자동매매 가능": 0,
         "강력 후보": 1,
         "관심 후보": 2,
+        "레이더 후보": 3,
         "보류": 8,
     }
     return order.get(decision.tier, 5)
@@ -4319,6 +4505,8 @@ def format_signal_decision(decision: Optional[SignalDecision]) -> str:
 
 
 def format_discovery_stage(stage: str) -> str:
+    if stage == "radar":
+        return "레이더 후보"
     if stage == "watchlist":
         return "관찰 후보"
     if stage == "strict":
@@ -4461,6 +4649,42 @@ def watchlist_relative_strength_minimum() -> float:
         "WATCHLIST_MIN_RELATIVE_STRENGTH_60D",
         WATCHLIST_MIN_RELATIVE_STRENGTH_60D,
         {"conservative": -2.0, "institutional": -5.0, "balanced": -6.0, "aggressive": -8.0},
+    )
+
+
+def radar_enabled() -> bool:
+    return env_bool("RADAR_ENABLED", RADAR_ENABLED)
+
+
+def radar_factor_score_minimum() -> float:
+    return env_float_profile(
+        "RADAR_MIN_FACTOR_SCORE",
+        RADAR_MIN_FACTOR_SCORE,
+        {"conservative": 45.0, "institutional": 35.0, "balanced": 32.0, "aggressive": 28.0},
+    )
+
+
+def radar_investment_thesis_minimum() -> float:
+    return env_float_profile(
+        "RADAR_MIN_INVESTMENT_THESIS_SCORE",
+        RADAR_MIN_INVESTMENT_THESIS_SCORE,
+        {"conservative": 45.0, "institutional": 35.0, "balanced": 32.0, "aggressive": 28.0},
+    )
+
+
+def radar_data_quality_min_score() -> float:
+    return env_float_profile(
+        "RADAR_MIN_DATA_QUALITY_SCORE",
+        RADAR_MIN_DATA_QUALITY_SCORE,
+        {"conservative": 60.0, "institutional": 50.0, "balanced": 45.0, "aggressive": 40.0},
+    )
+
+
+def radar_relative_strength_minimum() -> float:
+    return env_float_profile(
+        "RADAR_MIN_RELATIVE_STRENGTH_60D",
+        RADAR_MIN_RELATIVE_STRENGTH_60D,
+        {"conservative": -12.0, "institutional": -20.0, "balanced": -25.0, "aggressive": -30.0},
     )
 
 
