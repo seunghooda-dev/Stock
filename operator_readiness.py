@@ -36,6 +36,10 @@ from stock_telegram_bot import (
     investment_thesis_minimum,
     mask_account,
     normalize_trading_env,
+    watchlist_data_quality_min_score,
+    watchlist_enabled,
+    watchlist_factor_score_minimum,
+    watchlist_investment_thesis_minimum,
 )
 
 
@@ -219,6 +223,23 @@ class OperatorReadinessAuditor:
                 f"최소 데이터 신뢰도 {data_quality_min_score():.1f}"
             ),
         )
+        if watchlist_enabled():
+            self._pass(
+                "Policy",
+                "Watchlist gate",
+                (
+                    f"관찰 점수 {watchlist_factor_score_minimum():.1f}, "
+                    f"관찰 가설 {watchlist_investment_thesis_minimum():.1f}, "
+                    f"관찰 DQ {watchlist_data_quality_min_score():.1f}"
+                ),
+            )
+        else:
+            self._warn(
+                "Policy",
+                "Watchlist gate",
+                "관찰 후보 발굴이 비활성화되어 있습니다.",
+                "후보 부족 시 WATCHLIST_ENABLED=true를 권장합니다.",
+            )
         self._pass(
             "Policy",
             "Trade gate",
@@ -439,6 +460,10 @@ class OperatorReadinessAuditor:
             "min_factor_score": factor_score_minimum(),
             "min_investment_thesis_score": investment_thesis_minimum(),
             "min_data_quality": data_quality_min_score(),
+            "watchlist_enabled": watchlist_enabled(),
+            "watchlist_min_factor_score": watchlist_factor_score_minimum(),
+            "watchlist_min_investment_thesis_score": watchlist_investment_thesis_minimum(),
+            "watchlist_min_data_quality": watchlist_data_quality_min_score(),
             "strong_buy_score": policy.strong_buy_score,
             "auto_trade_min_score": policy.trade_ready_score,
             "auto_trade_min_data_quality": policy.auto_min_data_quality,

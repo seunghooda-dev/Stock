@@ -184,6 +184,16 @@ KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 
 
 현재 권장값은 `institutional`, `MIN_FACTOR_SCORE=72`, `MIN_DATA_QUALITY_SCORE=80`, `AUTO_TRADE_MIN_SCORE=82`, `AUTO_TRADE_MIN_DATA_QUALITY=85`입니다.
 
+## 단계별 종목 발굴
+
+기준이 너무 높아 후보를 놓치는 문제를 줄이기 위해 발굴 단계와 주문 단계를 분리했습니다. 기본값은 `WATCHLIST_ENABLED=true`입니다.
+
+- `관찰 후보`: RSI 35~60, 20일선 ±6~15% 범위, 60일 상대강도 -2%p 이상, 손익비 0.8 이상이면 후보군에 올립니다. 수급 매집은 점수에는 반영하지만 필수 조건은 아닙니다.
+- `강력 후보`: 정규 기술 조건과 종합 점수를 통과했지만 자동매매 하위 점수, 손절폭, 데이터 신뢰도 중 일부가 부족한 알림 우선 후보입니다.
+- `자동매매 가능`: 정규 후보 중 `AUTO_TRADE_MIN_SCORE`, `AUTO_TRADE_MIN_DATA_QUALITY`, 손절폭, 재무/수급/기술/리스크 하위 점수를 모두 통과한 경우에만 주문 계획으로 넘어갑니다.
+
+추천 기본값은 `WATCHLIST_MIN_FACTOR_SCORE=62`, `WATCHLIST_MIN_INVESTMENT_THESIS_SCORE=60`, `WATCHLIST_MIN_DATA_QUALITY_SCORE=75`입니다. 이렇게 하면 발견 폭은 넓히되, 실전 주문은 기존보다 느슨해지지 않습니다.
+
 ## 의사결정 등급
 
 봇은 최종 후보를 바로 같은 수준의 매수 신호로 보지 않고, 근거와 보류 사유를 함께 붙여 3단계로 나눕니다.
