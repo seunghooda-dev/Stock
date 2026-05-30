@@ -39,6 +39,7 @@ KIS_ACCOUNT_PRODUCT_CODE = "01"
 KIS_TRADING_ENV = "real"
 KIS_MAX_RETRIES = 2
 KIS_RETRY_DELAY_SECONDS = 1.0
+KIS_DAILY_PRICE_ENABLED = False
 
 # Scanner settings
 STRATEGY_PROFILE = "institutional"  # conservative, institutional, balanced, aggressive
@@ -182,10 +183,19 @@ MIN_FACTOR_SCORE = 60.0
 # Discovery tier settings. Watchlist candidates are allowed to be wider, but
 # auto-trading still goes through the strict gates below.
 WATCHLIST_ENABLED = True
-WATCHLIST_MIN_FACTOR_SCORE = 62.0
-WATCHLIST_MIN_INVESTMENT_THESIS_SCORE = 60.0
-WATCHLIST_MIN_DATA_QUALITY_SCORE = 75.0
+WATCHLIST_MIN_FACTOR_SCORE = 58.0
+WATCHLIST_MIN_INVESTMENT_THESIS_SCORE = 55.0
+WATCHLIST_MIN_DATA_QUALITY_SCORE = 68.0
 WATCHLIST_REQUIRE_SMART_MONEY = False
+WATCHLIST_MAX_DEBT_TO_EQUITY = 180.0
+WATCHLIST_MIN_CURRENT_RATIO = 100.0
+WATCHLIST_MAX_PBR = 2.5
+WATCHLIST_REQUIRED_PROFIT_YEARS = 2
+WATCHLIST_MIN_FINANCIAL_DATA_QUALITY_SCORE = 58.0
+WATCHLIST_MIN_ROE = 0.0
+WATCHLIST_MIN_OPERATING_MARGIN = 0.0
+WATCHLIST_MIN_REVENUE_GROWTH_YOY = -20.0
+WATCHLIST_MIN_OPERATING_INCOME_GROWTH_YOY = -50.0
 
 # Technical filters
 RSI_WINDOW = 14
@@ -208,19 +218,19 @@ MIN_INTERMEDIATE_MOMENTUM_120_20D = -5.0
 MIN_HIGH_PROXIMITY_180D = 65.0
 MAX_HIGH_PROXIMITY_180D = 104.0
 MIN_RISK_REWARD_RATIO = 1.15
-WATCHLIST_MIN_RSI = 35.0
-WATCHLIST_MAX_RSI = 60.0
-WATCHLIST_MA_SUPPORT_BAND = 0.06
-WATCHLIST_MAX_DISTANCE_ABOVE_MA20 = 0.15
-WATCHLIST_MAX_RELATIVE_VOLATILITY = 1.35
-WATCHLIST_MIN_RELATIVE_STRENGTH_60D = -2.0
-WATCHLIST_MIN_RETURN_20D = -12.0
-WATCHLIST_MAX_RETURN_20D = 32.0
-WATCHLIST_MAX_RETURN_120D = 150.0
-WATCHLIST_MAX_DRAWDOWN_60D = 32.0
-WATCHLIST_MIN_INTERMEDIATE_MOMENTUM_120_20D = -12.0
-WATCHLIST_MIN_HIGH_PROXIMITY_180D = 58.0
-WATCHLIST_MIN_RISK_REWARD_RATIO = 0.80
+WATCHLIST_MIN_RSI = 30.0
+WATCHLIST_MAX_RSI = 65.0
+WATCHLIST_MA_SUPPORT_BAND = 0.10
+WATCHLIST_MAX_DISTANCE_ABOVE_MA20 = 0.20
+WATCHLIST_MAX_RELATIVE_VOLATILITY = 1.60
+WATCHLIST_MIN_RELATIVE_STRENGTH_60D = -5.0
+WATCHLIST_MIN_RETURN_20D = -18.0
+WATCHLIST_MAX_RETURN_20D = 45.0
+WATCHLIST_MAX_RETURN_120D = 180.0
+WATCHLIST_MAX_DRAWDOWN_60D = 40.0
+WATCHLIST_MIN_INTERMEDIATE_MOMENTUM_120_20D = -25.0
+WATCHLIST_MIN_HIGH_PROXIMITY_180D = 45.0
+WATCHLIST_MIN_RISK_REWARD_RATIO = 0.50
 
 # Real-order gates are stricter than alert gates.
 AUTO_TRADE_MIN_SCORE = 80.0
@@ -296,6 +306,7 @@ class FinancialMetrics:
     data_quality_score: float = 0.0
     data_quality_grade: str = "N/A"
     data_quality_warnings: List[str] = field(default_factory=list)
+    signal_stage: str = "strict"
 
 
 @dataclass
@@ -845,6 +856,8 @@ class FinancialScanner:
 
     def scan(self, stocks: List[StockMeta]) -> List[FinancialMetrics]:
         passed: List[FinancialMetrics] = []
+        strict_count = 0
+        watchlist_count = 0
 
         for index, stock_meta in enumerate(stocks, start=1):
             if index % 100 == 0:
@@ -856,11 +869,22 @@ class FinancialScanner:
                 continue
 
             if self._passes_financial_filters(metrics):
+                metrics.signal_stage = "strict"
+                strict_count += 1
+                passed.append(metrics)
+            elif watchlist_enabled() and self._passes_watchlist_financial_filters(metrics):
+                metrics.signal_stage = "watchlist"
+                watchlist_count += 1
                 passed.append(metrics)
 
             time.sleep(REQUEST_DELAY_SECONDS)
 
-        logger.info("재무 필터 통과 종목 수: %d개", len(passed))
+        logger.info(
+            "재무 필터 통과 종목 수: %d개(정규 %d개, 관찰 %d개)",
+            len(passed),
+            strict_count,
+            watchlist_count,
+        )
         self._save_cache()
         return passed
 
@@ -990,6 +1014,30 @@ class FinancialScanner:
             return False
         return True
 
+    def _passes_watchlist_financial_filters(self, metrics: FinancialMetrics) -> bool:
+        if metrics.debt_to_equity >= env_float("WATCHLIST_MAX_DEBT_TO_EQUITY", WATCHLIST_MAX_DEBT_TO_EQUITY):
+            return False
+        if metrics.current_ratio < env_float("WATCHLIST_MIN_CURRENT_RATIO", WATCHLIST_MIN_CURRENT_RATIO):
+            return False
+        if metrics.pbr >= env_float("WATCHLIST_MAX_PBR", WATCHLIST_MAX_PBR):
+            return False
+
+        required_years = max(1, env_int("WATCHLIST_REQUIRED_PROFIT_YEARS", WATCHLIST_REQUIRED_PROFIT_YEARS))
+        positive_years = sum(1 for value in metrics.operating_income_years[: max(required_years, REQUIRED_PROFIT_YEARS)] if value > 0)
+        if positive_years < required_years:
+            return False
+
+        min_quality = env_float(
+            "WATCHLIST_MIN_FINANCIAL_DATA_QUALITY_SCORE",
+            WATCHLIST_MIN_FINANCIAL_DATA_QUALITY_SCORE,
+        )
+        if metrics.data_quality_score < min_quality:
+            return False
+
+        if self._looks_like_severe_value_trap(metrics):
+            return False
+        return True
+
     @staticmethod
     def _validate_financial_metrics(
         metrics: FinancialMetrics,
@@ -1066,6 +1114,28 @@ class FinancialScanner:
             return True
         return False
 
+    @staticmethod
+    def _looks_like_severe_value_trap(metrics: FinancialMetrics) -> bool:
+        if metrics.roe is not None and metrics.roe < env_float("WATCHLIST_MIN_ROE", WATCHLIST_MIN_ROE):
+            return True
+        if (
+            metrics.operating_margin is not None
+            and metrics.operating_margin < env_float("WATCHLIST_MIN_OPERATING_MARGIN", WATCHLIST_MIN_OPERATING_MARGIN)
+        ):
+            return True
+        if (
+            metrics.revenue_growth_yoy is not None
+            and metrics.revenue_growth_yoy < env_float("WATCHLIST_MIN_REVENUE_GROWTH_YOY", WATCHLIST_MIN_REVENUE_GROWTH_YOY)
+        ):
+            return True
+        if (
+            metrics.operating_income_growth_yoy is not None
+            and metrics.operating_income_growth_yoy
+            < env_float("WATCHLIST_MIN_OPERATING_INCOME_GROWTH_YOY", WATCHLIST_MIN_OPERATING_INCOME_GROWTH_YOY)
+        ):
+            return True
+        return False
+
     def _get_cached_metrics(self, code: str) -> Optional[FinancialMetrics]:
         item = self.cache.get(code)
         if not item:
@@ -1103,6 +1173,7 @@ class FinancialScanner:
                 data_quality_score=float(metrics.get("data_quality_score", 0.0)),
                 data_quality_grade=str(metrics.get("data_quality_grade", "N/A")),
                 data_quality_warnings=list(metrics.get("data_quality_warnings") or []),
+                signal_stage=str(metrics.get("signal_stage", "strict")),
             )
         except Exception:
             return None
@@ -2189,7 +2260,7 @@ class TechnicalAnalyzer:
         )
 
     def _fetch_price_data(self, code: str) -> tuple[pd.DataFrame, DataQualityReport]:
-        if self.kis_provider.enabled:
+        if self.kis_provider.enabled and env_bool("KIS_DAILY_PRICE_ENABLED", KIS_DAILY_PRICE_ENABLED):
             try:
                 kis_data = self.kis_provider.fetch_daily_price(code, self.start_date, self.end_date)
                 kis_quality = DataQualityValidator.validate_price_frame(kis_data, "KIS 일봉")
@@ -3796,7 +3867,12 @@ class FinancialHealthBot:
             technicals = self.technical_analyzer.analyze(stock_meta, market_regime, mode=technical_mode)
             if technicals is None:
                 continue
-            signal_stage = technicals.signal_stage
+            signal_stage = (
+                "watchlist"
+                if metrics.signal_stage == "watchlist" or technicals.signal_stage == "watchlist"
+                else "strict"
+            )
+            technicals.signal_stage = signal_stage
 
             accumulation = self.accumulation_analyzer.analyze(stock_meta)
             if ENABLE_SMART_MONEY_FILTER and accumulation is None:
@@ -4360,7 +4436,7 @@ def watchlist_factor_score_minimum() -> float:
     return env_float_profile(
         "WATCHLIST_MIN_FACTOR_SCORE",
         WATCHLIST_MIN_FACTOR_SCORE,
-        {"conservative": 68.0, "institutional": 62.0, "balanced": 60.0, "aggressive": 58.0},
+        {"conservative": 64.0, "institutional": 58.0, "balanced": 56.0, "aggressive": 52.0},
     )
 
 
@@ -4368,7 +4444,7 @@ def watchlist_investment_thesis_minimum() -> float:
     return env_float_profile(
         "WATCHLIST_MIN_INVESTMENT_THESIS_SCORE",
         WATCHLIST_MIN_INVESTMENT_THESIS_SCORE,
-        {"conservative": 62.0, "institutional": 60.0, "balanced": 58.0, "aggressive": 56.0},
+        {"conservative": 60.0, "institutional": 55.0, "balanced": 53.0, "aggressive": 50.0},
     )
 
 
@@ -4376,7 +4452,7 @@ def watchlist_data_quality_min_score() -> float:
     return env_float_profile(
         "WATCHLIST_MIN_DATA_QUALITY_SCORE",
         WATCHLIST_MIN_DATA_QUALITY_SCORE,
-        {"conservative": 82.0, "institutional": 75.0, "balanced": 72.0, "aggressive": 70.0},
+        {"conservative": 75.0, "institutional": 68.0, "balanced": 65.0, "aggressive": 60.0},
     )
 
 
@@ -4384,7 +4460,7 @@ def watchlist_relative_strength_minimum() -> float:
     return env_float_profile(
         "WATCHLIST_MIN_RELATIVE_STRENGTH_60D",
         WATCHLIST_MIN_RELATIVE_STRENGTH_60D,
-        {"conservative": 0.0, "institutional": -2.0, "balanced": -3.0, "aggressive": -5.0},
+        {"conservative": -2.0, "institutional": -5.0, "balanced": -6.0, "aggressive": -8.0},
     )
 
 
