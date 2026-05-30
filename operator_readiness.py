@@ -40,6 +40,7 @@ from stock_telegram_bot import (
     radar_enabled,
     radar_factor_score_minimum,
     radar_investment_thesis_minimum,
+    telegram_recommendation_limit,
     watchlist_data_quality_min_score,
     watchlist_enabled,
     watchlist_factor_score_minimum,
@@ -226,6 +227,11 @@ class OperatorReadinessAuditor:
                 f"투자 가설 {investment_thesis_minimum():.1f}, "
                 f"최소 데이터 신뢰도 {data_quality_min_score():.1f}"
             ),
+        )
+        self._pass(
+            "Policy",
+            "Recommendation limit",
+            f"전체 리서치 후 텔레그램 상위 {telegram_recommendation_limit()}개만 표시",
         )
         if watchlist_enabled():
             self._pass(
@@ -481,6 +487,7 @@ class OperatorReadinessAuditor:
             "min_factor_score": factor_score_minimum(),
             "min_investment_thesis_score": investment_thesis_minimum(),
             "min_data_quality": data_quality_min_score(),
+            "telegram_recommendation_limit": telegram_recommendation_limit(),
             "watchlist_enabled": watchlist_enabled(),
             "watchlist_min_factor_score": watchlist_factor_score_minimum(),
             "watchlist_min_investment_thesis_score": watchlist_investment_thesis_minimum(),

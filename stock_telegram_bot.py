@@ -47,6 +47,7 @@ RUN_TIME_KST = "16:00"
 LOOKBACK_DAYS = 220
 MIN_HISTORY_DAYS = 80
 MAX_REPORTS = 20
+TELEGRAM_RECOMMENDATION_LIMIT = 3
 REQUEST_DELAY_SECONDS = 0.15
 KIS_DAILY_CHUNK_DAYS = 60
 FUNDAMENTAL_CACHE_DAYS = 7
@@ -61,7 +62,7 @@ MAX_INVESTOR_DATA_STALENESS_DAYS = 10
 MAX_CROSS_SOURCE_CLOSE_DIFF_PCT = 2.5
 MAX_OHLC_ANOMALY_RATIO = 0.02
 MAX_SINGLE_DAY_MOVE_PCT = 35.0
-IMMEDIATE_ALERTS_ENABLED = True
+IMMEDIATE_ALERTS_ENABLED = False
 IMMEDIATE_ALERT_COOLDOWN_HOURS = 20
 
 # Intraday realtime scanner settings.
@@ -3505,17 +3506,29 @@ class RealtimeScanner:
             logger.warning("실시간 감시 후보군 로드 실패: %s", exc)
             return []
 
-    def build_candidate_message(self, reports: List[DiscoveryReport], regimes: Dict[str, MarketRegime]) -> str:
+    def build_candidate_message(
+        self,
+        reports: List[DiscoveryReport],
+        regimes: Dict[str, MarketRegime],
+        display_limit: Optional[int] = None,
+        researched_count: Optional[int] = None,
+    ) -> str:
+        internal_count = min(len(reports), self.max_watchlist)
+        visible_limit = max(1, display_limit or telegram_recommendation_limit())
+        visible_count = min(visible_limit, internal_count)
+        total_researched = researched_count if researched_count is not None else len(reports)
         lines = [
             "🧭 실시간 감시 후보군 준비 완료",
             f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            f"📌 후보 수: {min(len(reports), self.max_watchlist)}개",
+            f"🔎 전체 리서치 후보 {total_researched}개",
+            f"📌 내부 감시 후보 수: {internal_count}개",
+            f"🏆 텔레그램 표시: 종합점수 상위 {visible_count}개",
             f"🛡️ KOSPI: {regimes['KOSPI'].summary} / Risk-On={regimes['KOSPI'].risk_on}",
             f"🛡️ KOSDAQ: {regimes['KOSDAQ'].summary} / Risk-On={regimes['KOSDAQ'].risk_on}",
             f"⏱️ 감시 시간: {self.scan_start}~{self.scan_end}, {self.scan_interval_seconds}초 간격",
             "🔢 정렬 기준: 종합점수 높은 순",
         ]
-        for report in FinancialHealthBot._rank_reports(reports)[: min(5, self.max_watchlist)]:
+        for report in FinancialHealthBot._rank_reports(reports)[:visible_count]:
             thesis_text = f"가설 {report.thesis.total:.1f}({report.thesis.label})" if report.thesis else "가설 N/A"
             lines.append(
                 f"- {report.stock.name}({report.stock.code}) "
@@ -3896,27 +3909,35 @@ class FinancialHealthBot:
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
         try:
-            reports, regimes = self._discover_reports(send_immediate_alerts=IMMEDIATE_ALERTS_ENABLED)
+            reports, regimes = self._discover_reports(send_immediate_alerts=False)
             market_regime = regimes["KOSPI"]
             if not any(regime.risk_on for regime in regimes.values()):
                 logger.info("Risk-Off 국면이므로 매수 후보 스캔을 중단합니다.")
                 self.notifier.send(self._build_risk_off_message(market_regime))
                 return
 
-            reports = self._rank_reports(reports)[:MAX_REPORTS]
-            self.realtime_scanner.save_candidate_pool(reports, regimes)
-            order_plans = self.trading_engine.prepare_buy_plans(reports, market_regime)
+            ranked_reports = self._rank_reports(reports)
+            research_pool = ranked_reports[:MAX_REPORTS]
+            recommendations = self._top_recommendations(ranked_reports)
+            self.realtime_scanner.save_candidate_pool(research_pool, regimes)
+            order_plans = self.trading_engine.prepare_buy_plans(recommendations, market_regime)
             self.trading_engine.save_pending_plans(order_plans)
             self.notifier.send(
                 self._build_message(
-                    reports=reports,
+                    reports=recommendations,
                     market_regime=market_regime,
                     order_plans=order_plans,
                     trading_status=self.trading_engine.status_summary(),
+                    researched_count=len(ranked_reports),
+                    research_pool_count=len(research_pool),
                 )
             )
             self._save_alert_cache()
-            logger.info("재무 건전성 종목 발굴 작업 완료. 최종 후보: %d개", len(reports))
+            logger.info(
+                "재무 건전성 종목 발굴 작업 완료. 전체 후보: %d개, 전송 추천: %d개",
+                len(ranked_reports),
+                len(recommendations),
+            )
         except Exception as exc:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
             self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
@@ -3925,10 +3946,22 @@ class FinancialHealthBot:
         logger.info("실시간 감시 후보군 준비 시작")
         try:
             reports, regimes = self._discover_reports(send_immediate_alerts=False)
-            reports = self._rank_reports(reports)[: self.realtime_scanner.max_watchlist]
-            self.realtime_scanner.save_candidate_pool(reports, regimes)
-            self.notifier.send(self.realtime_scanner.build_candidate_message(reports, regimes))
-            logger.info("실시간 감시 후보군 준비 완료: %d개", len(reports))
+            ranked_reports = self._rank_reports(reports)
+            watchlist_reports = ranked_reports[: self.realtime_scanner.max_watchlist]
+            self.realtime_scanner.save_candidate_pool(watchlist_reports, regimes)
+            self.notifier.send(
+                self.realtime_scanner.build_candidate_message(
+                    watchlist_reports,
+                    regimes,
+                    display_limit=telegram_recommendation_limit(),
+                    researched_count=len(ranked_reports),
+                )
+            )
+            logger.info(
+                "실시간 감시 후보군 준비 완료. 전체 후보: %d개, 내부 감시: %d개",
+                len(ranked_reports),
+                len(watchlist_reports),
+            )
         except Exception as exc:
             logger.exception("실시간 감시 후보군 준비 실패: %s", exc)
             self.notifier.send(f"⚠️ 실시간 후보군 준비 오류\n{exc}")
@@ -4248,6 +4281,10 @@ class FinancialHealthBot:
         )
 
     @staticmethod
+    def _top_recommendations(reports: List[DiscoveryReport]) -> List[DiscoveryReport]:
+        return FinancialHealthBot._rank_reports(reports)[:telegram_recommendation_limit()]
+
+    @staticmethod
     def _build_reason(metrics: FinancialMetrics, technicals: TechnicalSnapshot) -> str:
         margin_text = "영업이익률 확인 가능"
         if metrics.operating_margin is not None:
@@ -4266,23 +4303,31 @@ class FinancialHealthBot:
         market_regime: MarketRegime,
         order_plans: Optional[List[OrderPlan]] = None,
         trading_status: str = "",
+        researched_count: Optional[int] = None,
+        research_pool_count: Optional[int] = None,
     ) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
+        total_researched = researched_count if researched_count is not None else len(reports)
+        recommendation_limit = telegram_recommendation_limit()
         if not reports:
             return (
                 f"📊 재무 건전성 알짜 기업 스캐너\n"
                 f"🗓 {today}\n\n"
                 f"🛡️ 시장 국면: {market_regime.summary} / Risk-On\n\n"
-                "오늘은 재무, 저변동성, 수급, 기술적 타점 조건을 모두 만족한 종목이 없습니다."
+                f"🔎 전체 리서치 후보 {total_researched}개\n"
+                "오늘은 텔레그램으로 보낼 상위 추천 종목이 없습니다."
             )
 
         lines = [
             "📊 재무 건전성 알짜 기업 스캐너",
             f"🗓 {today}",
             f"🛡️ 시장 국면: {market_regime.summary} / Risk-On",
-            f"✅ 최종 발굴 종목 {len(reports)}개",
+            f"🔎 전체 리서치 후보 {total_researched}개",
+            f"🏆 텔레그램 추천: 종합점수 상위 {len(reports)}개 / 표시 한도 {recommendation_limit}개",
             "🔢 정렬 기준: 종합점수 높은 순",
         ]
+        if research_pool_count is not None and research_pool_count > len(reports):
+            lines.append(f"📁 내부 감시/캐시 보관: 상위 {research_pool_count}개")
 
         for report in reports:
             financials = report.financials
@@ -4702,6 +4747,10 @@ def data_quality_min_score() -> float:
         MIN_DATA_QUALITY_SCORE,
         {"conservative": 90.0, "institutional": 80.0, "balanced": 75.0, "aggressive": 70.0},
     )
+
+
+def telegram_recommendation_limit() -> int:
+    return max(1, env_int("TELEGRAM_RECOMMENDATION_LIMIT", TELEGRAM_RECOMMENDATION_LIMIT))
 
 
 def parse_hhmm(value: str) -> tuple[int, int]:
