@@ -10,7 +10,8 @@ KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평
 2. `.env`에 텔레그램/KIS 값을 입력
 3. 바탕화면의 `StockBot_Check.bat` 실행
 4. 점검 결과가 `ALERT_READY` 또는 `DEMO_TRADE_READY`이면 `StockBot_Run.bat` 실행
-5. 실계좌 자동매매는 `operator_readiness.py --target live-trading`이 통과하고, 모의운영 로그를 충분히 확인한 뒤에만 전환
+5. 운영 중에는 `StockBot_Status.bat`으로 최근 리서치, 후보군, 락, 로그를 확인
+6. 실계좌 자동매매는 `operator_readiness.py --target live-trading`이 통과하고, 모의운영 로그를 충분히 확인한 뒤에만 전환
 
 운영 판단 기준은 단순합니다.
 
@@ -273,6 +274,7 @@ notepad .env
 
 - `logs/bot.log`: 콘솔과 별개로 남는 회전 로그 파일입니다. 파일이 커지면 자동으로 백업됩니다.
 - `cache/bot_state.json`: 최근 장마감 리서치, 실시간 스캔, 뉴스 스캔, 자동매매 실행 상태와 후보 수, 상위 추천 요약을 저장합니다.
+- `cache/latest_research_report.json`: 마지막 전체 리서치의 추천 Top 3, 내부 감시 후보, 점수/재무/기술/수급 근거를 저장합니다.
 - `cache/*.lock`: 같은 작업이 중복 실행되지 않도록 막는 실행 락입니다. 오래된 락은 설정 시간 이후 자동 제거됩니다.
 
 중복 실행 방지 기본값은 아래와 같습니다.
@@ -287,6 +289,15 @@ SCHEDULER_LOCK_STALE_MINUTES=720
 ```powershell
 .\.venv\Scripts\python.exe operator_readiness.py --target alert --no-network
 ```
+
+더 자세한 운영 대시보드는 아래 명령 또는 바탕화면의 `StockBot_Status.bat`으로 확인합니다.
+
+```powershell
+.\.venv\Scripts\python.exe status_stock_bot.py
+.\.venv\Scripts\python.exe status_stock_bot.py --json
+```
+
+상태 대시보드는 실행 중인 봇 프로세스, 최근 작업별 성공/실패, 최신 리서치 Top 3, 실시간 후보군 수, 대기 주문, 뉴스 알림, 활성 락, 로그 마지막 줄을 보여줍니다.
 
 텔레그램 장마감 리포트 상단에는 전체 리서치 후보 수, 내부 감시 후보 수, 추천 컷 점수, 후보 분포가 표시됩니다. 상세 리포트는 `TOP 1~3`만 내려가므로 낮은 점수 후보가 추천처럼 섞이지 않습니다.
 

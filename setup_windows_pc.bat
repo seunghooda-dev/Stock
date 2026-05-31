@@ -54,4 +54,5 @@ echo Next step:
 echo 1. Edit .env with Telegram/KIS settings.
 echo 2. Run "StockBot_Check.bat" from Desktop.
 echo 3. If readiness passes, run "StockBot_Run.bat" from Desktop.
+echo 4. Use "StockBot_Status.bat" from Desktop to inspect current bot state.
 pause

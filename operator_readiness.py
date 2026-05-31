@@ -156,6 +156,7 @@ class OperatorReadinessAuditor:
             "backtest_stock_bot.py",
             "validate_data_sources.py",
             "test_kis_connection.py",
+            "status_stock_bot.py",
             "requirements.txt",
             "README.md",
         ]
@@ -526,6 +527,7 @@ class OperatorReadinessAuditor:
             "install_startup_task.bat",
             "uninstall_startup_task.bat",
             "run_readiness_check.bat",
+            "show_stock_bot_status.bat",
         ]
         missing = [script for script in scripts if not (WORKSPACE / script).exists()]
         if missing:

@@ -283,6 +283,7 @@ REALTIME_CANDIDATE_FILE = CACHE_DIR / "realtime_candidates.json"
 REALTIME_ALERT_FILE = CACHE_DIR / "realtime_alerts.json"
 NEWS_ALERT_FILE = CACHE_DIR / "news_alerts.json"
 BOT_STATE_FILE = CACHE_DIR / "bot_state.json"
+LATEST_RESEARCH_REPORT_FILE = CACHE_DIR / "latest_research_report.json"
 SCHEDULER_LOCK_FILE = CACHE_DIR / "scheduler.lock"
 SCAN_LOCK_FILE = CACHE_DIR / "research_scan.lock"
 REALTIME_LOCK_FILE = CACHE_DIR / "realtime_scan.lock"
@@ -4157,6 +4158,14 @@ class FinancialHealthBot:
             research_pool = ranked_reports[:MAX_REPORTS]
             recommendations = self._top_recommendations(ranked_reports)
             research_summary = self._build_research_summary(ranked_reports, research_pool, recommendations)
+            self._save_latest_research_report(
+                ranked_reports=ranked_reports,
+                research_pool=research_pool,
+                recommendations=recommendations,
+                regimes=regimes,
+                research_summary=research_summary,
+                job_name="daily_research",
+            )
             self.realtime_scanner.save_candidate_pool(research_pool, regimes)
             order_plans = self.trading_engine.prepare_buy_plans(recommendations, market_regime)
             self.trading_engine.save_pending_plans(order_plans)
@@ -4197,6 +4206,20 @@ class FinancialHealthBot:
                 reports, regimes = self._discover_reports(send_immediate_alerts=False)
             ranked_reports = self._rank_reports(reports)
             watchlist_reports = ranked_reports[: self.realtime_scanner.max_watchlist]
+            recommendations = self._top_recommendations(ranked_reports)
+            research_summary = self._build_research_summary(
+                ranked_reports,
+                watchlist_reports,
+                recommendations,
+            )
+            self._save_latest_research_report(
+                ranked_reports=ranked_reports,
+                research_pool=watchlist_reports,
+                recommendations=recommendations,
+                regimes=regimes,
+                research_summary=research_summary,
+                job_name="candidate_preparation",
+            )
             self.realtime_scanner.save_candidate_pool(watchlist_reports, regimes)
             self.notifier.send(
                 self.realtime_scanner.build_candidate_message(
@@ -4215,11 +4238,7 @@ class FinancialHealthBot:
                 "candidate_preparation",
                 started_at,
                 "success",
-                self._build_research_summary(
-                    ranked_reports,
-                    watchlist_reports,
-                    self._top_recommendations(ranked_reports),
-                ),
+                research_summary,
             )
         except BotLockError as exc:
             logger.warning("실시간 감시 후보군 준비 건너뜀: %s", exc)
@@ -4631,6 +4650,39 @@ class FinancialHealthBot:
         }
 
     @staticmethod
+    def _save_latest_research_report(
+        ranked_reports: List[DiscoveryReport],
+        research_pool: List[DiscoveryReport],
+        recommendations: List[DiscoveryReport],
+        regimes: Dict[str, MarketRegime],
+        research_summary: Dict[str, object],
+        job_name: str,
+    ) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            payload = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "job_name": job_name,
+                "strategy_profile": active_strategy_profile(),
+                "recommendation_limit": telegram_recommendation_limit(),
+                "summary": research_summary,
+                "regimes": {market: asdict(regime) for market, regime in regimes.items()},
+                "recommendations": [
+                    FinancialHealthBot._report_audit_payload(report, rank)
+                    for rank, report in enumerate(recommendations, start=1)
+                ],
+                "research_pool": [
+                    FinancialHealthBot._report_audit_payload(report, rank)
+                    for rank, report in enumerate(research_pool, start=1)
+                ],
+                "candidate_count": len(ranked_reports),
+            }
+            with LATEST_RESEARCH_REPORT_FILE.open("w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("최신 리서치 리포트 저장 실패: %s", exc)
+
+    @staticmethod
     def _report_summary(report: DiscoveryReport, rank: int) -> Dict[str, object]:
         return {
             "rank": rank,
@@ -4646,6 +4698,56 @@ class FinancialHealthBot:
             "relative_strength_60d": round(report.technicals.relative_strength_60d, 1),
             "pbr": round(report.financials.pbr, 2),
         }
+
+    @staticmethod
+    def _report_audit_payload(report: DiscoveryReport, rank: int) -> Dict[str, object]:
+        summary = FinancialHealthBot._report_summary(report, rank)
+        summary.update(
+            {
+                "market": report.stock.market,
+                "current_price": round(report.technicals.current_price, 2),
+                "stop_loss": round(report.technicals.stop_loss, 2),
+                "market_cap": report.financials.market_cap,
+                "trading_value": report.stock.trading_value,
+                "factor_score": asdict(report.score) if report.score else None,
+                "investment_thesis": asdict(report.thesis) if report.thesis else None,
+                "decision_detail": asdict(report.decision) if report.decision else None,
+                "financials": {
+                    "debt_to_equity": round(report.financials.debt_to_equity, 2),
+                    "current_ratio": round(report.financials.current_ratio, 2),
+                    "pbr": round(report.financials.pbr, 3),
+                    "per": report.financials.per,
+                    "roe": report.financials.roe,
+                    "operating_margin": report.financials.operating_margin,
+                    "revenue_growth_yoy": report.financials.revenue_growth_yoy,
+                    "operating_income_growth_yoy": report.financials.operating_income_growth_yoy,
+                    "source": report.financials.financial_source,
+                    "data_quality": round(report.financials.data_quality_score, 1),
+                },
+                "technicals": {
+                    "rsi": round(report.technicals.rsi, 2),
+                    "ma20": round(report.technicals.ma20, 2),
+                    "ma60": round(report.technicals.ma60, 2),
+                    "return_20d": round(report.technicals.return_20d, 2),
+                    "return_60d": round(report.technicals.return_60d, 2),
+                    "return_120d": round(report.technicals.return_120d, 2),
+                    "relative_strength_60d": round(report.technicals.relative_strength_60d, 2),
+                    "max_drawdown_60d": round(report.technicals.max_drawdown_60d, 2),
+                    "risk_reward_ratio": round(report.technicals.risk_reward_ratio, 2),
+                    "trend_summary": report.technicals.trend_summary,
+                    "price_source": report.technicals.price_source,
+                    "data_quality": round(report.technicals.data_quality_score, 1),
+                },
+                "accumulation": asdict(report.accumulation) if report.accumulation else None,
+                "data_quality": {
+                    "score": round(report.data_quality_score, 1),
+                    "grade": report.data_quality_grade,
+                    "warnings": report.data_quality_warnings[:5],
+                },
+                "reason": report.reason,
+            }
+        )
+        return summary
 
     @staticmethod
     def _build_reason(metrics: FinancialMetrics, technicals: TechnicalSnapshot) -> str:
