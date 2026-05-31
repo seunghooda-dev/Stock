@@ -329,6 +329,14 @@ configure_logging()
 logger = logging.getLogger("financial-health-scanner")
 
 
+def write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+    temp_path.replace(path)
+
+
 @dataclass
 class StockMeta:
     code: str
@@ -699,9 +707,7 @@ class OperationStateStore:
 
     def _save(self, state: Dict[str, object]) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with self.path.open("w", encoding="utf-8") as file:
-                json.dump(state, file, ensure_ascii=False, indent=2)
+            write_json_atomic(self.path, state)
         except Exception as exc:
             logger.warning("운영 상태 파일 저장 실패: %s", exc)
 
@@ -1506,9 +1512,7 @@ class FinancialScanner:
 
     def _save_cache(self) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with FUNDAMENTAL_CACHE_FILE.open("w", encoding="utf-8") as file:
-                json.dump(self.cache, file, ensure_ascii=False, indent=2)
+            write_json_atomic(FUNDAMENTAL_CACHE_FILE, self.cache)
         except Exception as exc:
             logger.warning("재무 캐시 저장 실패: %s", exc)
 
@@ -1920,18 +1924,14 @@ class KISDataProvider:
 
     def _save_cached_token(self, token: str, expires_at: datetime) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with KIS_TOKEN_CACHE_FILE.open("w", encoding="utf-8") as file:
-                json.dump(
-                    {
-                        "access_token": token,
-                        "expires_at": expires_at.isoformat(timespec="seconds"),
-                        "base_url": self.base_url,
-                    },
-                    file,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+            write_json_atomic(
+                KIS_TOKEN_CACHE_FILE,
+                {
+                    "access_token": token,
+                    "expires_at": expires_at.isoformat(timespec="seconds"),
+                    "base_url": self.base_url,
+                },
+            )
         except Exception as exc:
             logger.warning("KIS 토큰 캐시 저장 실패: %s", exc)
 
@@ -3358,15 +3358,13 @@ class TradingEngine:
         if not self.enabled or not plans:
             return
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
             payload = {
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "trading_env": self.kis_provider.trading_env,
                 "dry_run": self.dry_run,
                 "plans": [asdict(plan) for plan in plans],
             }
-            with PENDING_TRADE_FILE.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
+            write_json_atomic(PENDING_TRADE_FILE, payload)
             logger.info("자동매매 대기 주문 %d건 저장", len(plans))
         except Exception as exc:
             logger.warning("자동매매 대기 주문 저장 실패: %s", exc)
@@ -3559,9 +3557,7 @@ class TradingEngine:
     @staticmethod
     def _save_trade_history(history: Dict[str, str]) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with TRADE_HISTORY_FILE.open("w", encoding="utf-8") as file:
-                json.dump(history, file, ensure_ascii=False, indent=2)
+            write_json_atomic(TRADE_HISTORY_FILE, history)
         except Exception as exc:
             logger.warning("자동매매 이력 저장 실패: %s", exc)
 
@@ -3625,14 +3621,12 @@ class RealtimeScanner:
         ]
 
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
             payload = {
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "regimes": {market: asdict(regime) for market, regime in regimes.items()},
                 "candidates": [asdict(candidate) for candidate in candidates],
             }
-            with REALTIME_CANDIDATE_FILE.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
+            write_json_atomic(REALTIME_CANDIDATE_FILE, payload)
             logger.info("실시간 감시 후보군 %d개 저장", len(candidates))
         except Exception as exc:
             logger.warning("실시간 감시 후보군 저장 실패: %s", exc)
@@ -3909,9 +3903,7 @@ class RealtimeScanner:
 
     def _save_alert_cache(self) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with REALTIME_ALERT_FILE.open("w", encoding="utf-8") as file:
-                json.dump(self.alert_cache, file, ensure_ascii=False, indent=2)
+            write_json_atomic(REALTIME_ALERT_FILE, self.alert_cache)
         except Exception as exc:
             logger.warning("실시간 알림 캐시 저장 실패: %s", exc)
 
@@ -4079,12 +4071,10 @@ class NewsPulseMonitor:
 
     def _save_cache(self, impacts: List[NewsImpact]) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
             alerts = list(self.cache.get("alerts") or [])
             alerts.extend(asdict(impact) for impact in impacts)
             self.cache["alerts"] = alerts[-300:]
-            with NEWS_ALERT_FILE.open("w", encoding="utf-8") as file:
-                json.dump(self.cache, file, ensure_ascii=False, indent=2)
+            write_json_atomic(NEWS_ALERT_FILE, self.cache)
         except Exception as exc:
             logger.warning("뉴스 알림 캐시 저장 실패: %s", exc)
 
@@ -4132,6 +4122,7 @@ class FinancialHealthBot:
         self.news_monitor = NewsPulseMonitor(self.notifier)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
         self.state_store = OperationStateStore()
+        self.last_discovery_stats: Dict[str, object] = {}
 
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
@@ -4157,7 +4148,12 @@ class FinancialHealthBot:
             ranked_reports = self._rank_reports(reports)
             research_pool = ranked_reports[:MAX_REPORTS]
             recommendations = self._top_recommendations(ranked_reports)
-            research_summary = self._build_research_summary(ranked_reports, research_pool, recommendations)
+            research_summary = self._build_research_summary(
+                ranked_reports,
+                research_pool,
+                recommendations,
+                discovery_stats=self.last_discovery_stats,
+            )
             self._save_latest_research_report(
                 ranked_reports=ranked_reports,
                 research_pool=research_pool,
@@ -4211,6 +4207,7 @@ class FinancialHealthBot:
                 ranked_reports,
                 watchlist_reports,
                 recommendations,
+                discovery_stats=self.last_discovery_stats,
             )
             self._save_latest_research_report(
                 ranked_reports=ranked_reports,
@@ -4330,13 +4327,22 @@ class FinancialHealthBot:
             self.notifier.send(f"⚠️ 자동매매 실행 오류\n{exc}")
 
     def _discover_reports(self, send_immediate_alerts: bool) -> tuple[List[DiscoveryReport], Dict[str, MarketRegime]]:
+        started_at = datetime.now()
         regimes = self.market_regime_filter.analyze_by_market()
+        stats = self._new_discovery_stats(regimes)
+        self.last_discovery_stats = stats
         if not any(regime.risk_on for regime in regimes.values()):
+            stats["risk_on"] = False
+            stats["duration_seconds"] = round((datetime.now() - started_at).total_seconds(), 1)
             return [], regimes
 
         universe = self.financial_scanner.fetch_universe()
+        stats["universe_count"] = len(universe)
         stock_map = {stock.code: stock for stock in universe}
         financially_strong = self.financial_scanner.scan(universe)
+        stats["financial_pass_count"] = len(financially_strong)
+        for metrics in financially_strong:
+            self._increment_nested_count(stats, "financial_stage_counts", metrics.signal_stage)
 
         reports: List[DiscoveryReport] = []
         min_factor_score = factor_score_minimum()
@@ -4351,14 +4357,17 @@ class FinancialHealthBot:
         for metrics in financially_strong:
             stock_meta = stock_map.get(metrics.code)
             if stock_meta is None:
+                self._increment_nested_count(stats, "rejections", "missing_metadata")
                 continue
 
             market_regime = self.market_regime_filter.select_for_market(stock_meta.market, regimes)
             if not market_regime.risk_on:
+                self._increment_nested_count(stats, "rejections", "market_risk_off")
                 continue
 
             technicals = self.technical_analyzer.analyze(stock_meta, market_regime, mode=technical_mode)
             if technicals is None:
+                self._increment_nested_count(stats, "rejections", "technical_failed")
                 continue
             signal_stage = self._combine_signal_stage(metrics.signal_stage, technicals.signal_stage)
             technicals.signal_stage = signal_stage
@@ -4374,6 +4383,7 @@ class FinancialHealthBot:
                     signal_stage = "radar"
                     technicals.signal_stage = signal_stage
                 else:
+                    self._increment_nested_count(stats, "rejections", "smart_money_failed")
                     continue
 
             report = DiscoveryReport(
@@ -4425,6 +4435,7 @@ class FinancialHealthBot:
                     required_quality,
                     "; ".join(data_quality.warnings),
                 )
+                self._increment_nested_count(stats, "rejections", "data_quality_failed")
                 continue
             report.score = self.factor_scorer.score(report, market_regime)
             if (
@@ -4460,6 +4471,7 @@ class FinancialHealthBot:
                     report.score.total,
                     required_factor_score,
                 )
+                self._increment_nested_count(stats, "rejections", "factor_score_failed")
                 continue
             report.thesis = self.thesis_builder.build(report)
             strict_thesis_min = investment_thesis_minimum()
@@ -4499,6 +4511,7 @@ class FinancialHealthBot:
                     report.thesis.total,
                     required_thesis_score,
                 )
+                self._increment_nested_count(stats, "rejections", "thesis_failed")
                 continue
             report.decision = self.decision_policy.classify(report)
             if report.decision.tier == "보류":
@@ -4508,12 +4521,59 @@ class FinancialHealthBot:
                     report.stock.code,
                     "; ".join(report.decision.vetoes),
                 )
+                self._increment_nested_count(stats, "rejections", "decision_hold")
                 continue
             reports.append(report)
+            self._increment_nested_count(stats, "final_stage_counts", signal_stage)
+            if report.decision:
+                self._increment_nested_count(stats, "decision_counts", report.decision.tier)
             if send_immediate_alerts:
                 self._send_immediate_alert_if_needed(report, market_regime)
 
+        stats["final_candidate_count"] = len(reports)
+        stats["duration_seconds"] = round((datetime.now() - started_at).total_seconds(), 1)
         return reports, regimes
+
+    @staticmethod
+    def _new_discovery_stats(regimes: Dict[str, MarketRegime]) -> Dict[str, object]:
+        return {
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "risk_on": any(regime.risk_on for regime in regimes.values()),
+            "market_regimes": {
+                market: {
+                    "risk_on": regime.risk_on,
+                    "summary": regime.summary,
+                    "return_60d": round(regime.return_60d, 2),
+                    "volatility": round(regime.volatility * 100, 2),
+                }
+                for market, regime in regimes.items()
+            },
+            "universe_count": 0,
+            "financial_pass_count": 0,
+            "final_candidate_count": 0,
+            "financial_stage_counts": {"strict": 0, "watchlist": 0, "radar": 0},
+            "final_stage_counts": {"strict": 0, "watchlist": 0, "radar": 0},
+            "decision_counts": {},
+            "rejections": {
+                "missing_metadata": 0,
+                "market_risk_off": 0,
+                "technical_failed": 0,
+                "smart_money_failed": 0,
+                "data_quality_failed": 0,
+                "factor_score_failed": 0,
+                "thesis_failed": 0,
+                "decision_hold": 0,
+            },
+            "duration_seconds": 0.0,
+        }
+
+    @staticmethod
+    def _increment_nested_count(stats: Dict[str, object], key: str, item: str) -> None:
+        counts = stats.setdefault(key, {})
+        if not isinstance(counts, dict):
+            return
+        clean_item = item if item in {"strict", "watchlist", "radar"} else str(item or "unknown")
+        counts[clean_item] = int(counts.get(clean_item, 0)) + 1
 
     @staticmethod
     def _combine_signal_stage(*stages: str) -> str:
@@ -4591,9 +4651,7 @@ class FinancialHealthBot:
 
     def _save_alert_cache(self) -> None:
         try:
-            CACHE_DIR.mkdir(exist_ok=True)
-            with ALERT_CACHE_FILE.open("w", encoding="utf-8") as file:
-                json.dump(self.alert_cache, file, ensure_ascii=False, indent=2)
+            write_json_atomic(ALERT_CACHE_FILE, self.alert_cache)
         except Exception as exc:
             logger.warning("알림 캐시 저장 실패: %s", exc)
 
@@ -4623,6 +4681,7 @@ class FinancialHealthBot:
         ranked_reports: List[DiscoveryReport],
         research_pool: List[DiscoveryReport],
         recommendations: List[DiscoveryReport],
+        discovery_stats: Optional[Dict[str, object]] = None,
     ) -> Dict[str, object]:
         stage_counts = {"strict": 0, "watchlist": 0, "radar": 0}
         decision_counts: Dict[str, int] = {}
@@ -4638,6 +4697,7 @@ class FinancialHealthBot:
             "research_pool_count": len(research_pool),
             "recommendation_count": len(recommendations),
             "recommendation_limit": telegram_recommendation_limit(),
+            "discovery_pipeline": discovery_stats or {},
             "stage_counts": stage_counts,
             "decision_counts": decision_counts,
             "highest_score": round(max(scores), 1) if scores else None,
@@ -4677,8 +4737,7 @@ class FinancialHealthBot:
                 ],
                 "candidate_count": len(ranked_reports),
             }
-            with LATEST_RESEARCH_REPORT_FILE.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
+            write_json_atomic(LATEST_RESEARCH_REPORT_FILE, payload)
         except Exception as exc:
             logger.warning("최신 리서치 리포트 저장 실패: %s", exc)
 
@@ -4998,6 +5057,7 @@ def format_research_summary(summary: Optional[Dict[str, object]]) -> List[str]:
     if not summary:
         return []
     stage_counts = summary.get("stage_counts")
+    pipeline = summary.get("discovery_pipeline")
     score_text = "점수 범위 N/A"
     highest_score = summary.get("highest_score")
     cutoff_score = summary.get("cutoff_score")
@@ -5006,6 +5066,25 @@ def format_research_summary(summary: Optional[Dict[str, object]]) -> List[str]:
         score_text = f"최고 {highest_score}, 추천 컷 {cutoff_score}, 전체 최저 {lowest_score}"
 
     lines = [f"📊 점수 범위: {score_text}"]
+    if isinstance(pipeline, dict) and pipeline:
+        lines.append(
+            "🔬 발굴 경로: "
+            f"유니버스 {int(pipeline.get('universe_count', 0))} → "
+            f"재무 {int(pipeline.get('financial_pass_count', 0))} → "
+            f"최종 {int(pipeline.get('final_candidate_count', summary.get('total_candidates', 0)))}"
+        )
+        rejections = pipeline.get("rejections")
+        if isinstance(rejections, dict):
+            top_rejections = [
+                item
+                for item in sorted(rejections.items(), key=lambda item: int(item[1] or 0), reverse=True)
+                if int(item[1] or 0) > 0
+            ][:3]
+            if top_rejections:
+                lines.append(
+                    "🧱 주요 탈락: "
+                    + " / ".join(f"{format_rejection_reason(key)} {value}" for key, value in top_rejections)
+                )
     if isinstance(stage_counts, dict):
         lines.append(
             "🧮 후보 분포: "
@@ -5018,6 +5097,20 @@ def format_research_summary(summary: Optional[Dict[str, object]]) -> List[str]:
         ordered = sorted(decision_counts.items(), key=lambda item: str(item[0]))
         lines.append("🧭 판단 분포: " + " / ".join(f"{key} {value}" for key, value in ordered[:5]))
     return lines
+
+
+def format_rejection_reason(reason: str) -> str:
+    labels = {
+        "missing_metadata": "메타데이터",
+        "market_risk_off": "시장국면",
+        "technical_failed": "기술조건",
+        "smart_money_failed": "수급조건",
+        "data_quality_failed": "데이터품질",
+        "factor_score_failed": "팩터점수",
+        "thesis_failed": "투자가설",
+        "decision_hold": "의사결정보류",
+    }
+    return labels.get(reason, reason)
 
 
 def decision_rank(decision: Optional[SignalDecision]) -> int:

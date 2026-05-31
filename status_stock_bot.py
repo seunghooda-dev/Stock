@@ -119,6 +119,10 @@ def print_human(status: BotStatus) -> None:
             f"recommendations {research.get('recommendation_count', 'N/A')}"
         )
         print(f"- score range: {research.get('score_range', 'N/A')}")
+        if research.get("pipeline"):
+            print(f"- pipeline: {research.get('pipeline')}")
+        if research.get("bottlenecks"):
+            print(f"- bottlenecks: {research.get('bottlenecks')}")
         for item in research.get("top", []):
             print(
                 f"  TOP {item.get('rank')}: {item.get('name')}({item.get('code')}) "
@@ -216,6 +220,7 @@ def summarize_research(payload: Dict[str, object]) -> Dict[str, object]:
     if not payload:
         return {}
     summary = payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {}
+    pipeline = summary.get("discovery_pipeline", {}) if isinstance(summary.get("discovery_pipeline"), dict) else {}
     top = payload.get("recommendations", []) if isinstance(payload.get("recommendations"), list) else []
     return {
         "generated_at": payload.get("generated_at", ""),
@@ -229,6 +234,8 @@ def summarize_research(payload: Dict[str, object]) -> Dict[str, object]:
             f"lowest {summary.get('lowest_score', 'N/A')}"
         ),
         "stage_counts": summary.get("stage_counts", {}),
+        "pipeline": summarize_pipeline(pipeline),
+        "bottlenecks": summarize_bottlenecks(pipeline),
         "top": [
             {
                 "rank": item.get("rank"),
@@ -242,6 +249,37 @@ def summarize_research(payload: Dict[str, object]) -> Dict[str, object]:
             if isinstance(item, dict)
         ],
     }
+
+
+def summarize_pipeline(pipeline: Dict[str, object]) -> str:
+    if not pipeline:
+        return ""
+    return (
+        f"universe {pipeline.get('universe_count', 0)} -> "
+        f"financial {pipeline.get('financial_pass_count', 0)} -> "
+        f"final {pipeline.get('final_candidate_count', 0)}"
+    )
+
+
+def summarize_bottlenecks(pipeline: Dict[str, object]) -> str:
+    rejections = pipeline.get("rejections", {}) if isinstance(pipeline, dict) else {}
+    if not isinstance(rejections, dict) or not rejections:
+        return ""
+    labels = {
+        "technical_failed": "technical",
+        "factor_score_failed": "factor",
+        "thesis_failed": "thesis",
+        "data_quality_failed": "data_quality",
+        "smart_money_failed": "smart_money",
+        "decision_hold": "decision_hold",
+        "market_risk_off": "market",
+    }
+    top = [
+        (labels.get(str(key), str(key)), int(value or 0))
+        for key, value in sorted(rejections.items(), key=lambda item: int(item[1] or 0), reverse=True)
+        if int(value or 0) > 0
+    ][:3]
+    return ", ".join(f"{name} {count}" for name, count in top)
 
 
 def summarize_realtime_candidates(payload: Dict[str, object]) -> Dict[str, object]:
