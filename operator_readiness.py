@@ -22,6 +22,7 @@ from stock_telegram_bot import (
     AUTO_TRADE_ORDER_BUDGET_KRW,
     AUTO_TRADE_RISK_PER_TRADE_KRW,
     CACHE_DIR,
+    BOT_STATE_FILE,
     DataQualityValidator,
     DecisionPolicy,
     KISDataProvider,
@@ -54,6 +55,7 @@ GITIGNORE_FILE = WORKSPACE / ".gitignore"
 README_FILE = WORKSPACE / "README.md"
 LOCAL_CACHE_DIR = CACHE_DIR if CACHE_DIR.is_absolute() else WORKSPACE / CACHE_DIR
 BACKTEST_SUMMARY_FILE = LOCAL_CACHE_DIR / "backtest_summary.json"
+LOCAL_BOT_STATE_FILE = BOT_STATE_FILE if BOT_STATE_FILE.is_absolute() else WORKSPACE / BOT_STATE_FILE
 
 STATUS_PASS = "PASS"
 STATUS_WARN = "WARN"
@@ -100,6 +102,7 @@ class OperatorReadinessAuditor:
         self._check_kis()
         self._check_market_data()
         self._check_backtest_artifacts()
+        self._check_bot_state()
         self._check_operating_scripts()
 
         blocks = sum(1 for check in self.checks if check.status == STATUS_BLOCK)
@@ -457,6 +460,62 @@ class OperatorReadinessAuditor:
                 self._pass("Validation", "Backtest", f"표본 {trades}건, 승률 {win_rate}%, 평균 {avg_return}%")
         except Exception as exc:
             self._warn("Validation", "Backtest", f"결과 파일 읽기 실패: {exc}", "백테스트를 다시 실행하세요.")
+
+    def _check_bot_state(self) -> None:
+        if not LOCAL_BOT_STATE_FILE.exists():
+            self._warn(
+                "Operations",
+                "Bot state",
+                "운영 상태 파일이 아직 없습니다.",
+                "봇을 1회 실행하면 cache/bot_state.json에 최근 작업 상태가 기록됩니다.",
+            )
+            return
+
+        try:
+            with LOCAL_BOT_STATE_FILE.open("r", encoding="utf-8") as file:
+                state = json.load(file)
+            jobs = state.get("jobs", {}) if isinstance(state, dict) else {}
+            daily = jobs.get("daily_research", {}) if isinstance(jobs, dict) else {}
+            status = str(daily.get("status", "unknown"))
+            updated_at_text = str(daily.get("updated_at") or daily.get("finished_at") or "")
+            if not updated_at_text:
+                self._warn("Operations", "Bot state", f"최근 리서치 상태 {status}, 갱신시간 없음", "봇을 다시 실행해 상태 파일을 갱신하세요.")
+                return
+
+            updated_at = datetime.fromisoformat(updated_at_text)
+            age_hours = (datetime.now() - updated_at).total_seconds() / 3600
+            details = daily.get("details", {}) if isinstance(daily.get("details"), dict) else {}
+            recommendation_count = details.get("recommendation_count", "N/A")
+            total_candidates = details.get("total_candidates", "N/A")
+            if status == "failed":
+                self._warn(
+                    "Operations",
+                    "Bot state",
+                    f"마지막 리서치 실패: {details.get('error', '원인 미기록')}",
+                    "logs/bot.log와 cache/bot_state.json을 확인하세요.",
+                )
+            elif status == "running" and age_hours > 3:
+                self._warn(
+                    "Operations",
+                    "Bot state",
+                    f"리서치가 {age_hours:.1f}시간째 running 상태입니다.",
+                    "중복 실행 락이 남아 있으면 stop_stock_bot.bat 실행 후 다시 시작하세요.",
+                )
+            elif age_hours > 36:
+                self._warn(
+                    "Operations",
+                    "Bot state",
+                    f"마지막 리서치 갱신 {age_hours:.1f}시간 전",
+                    "상시 운영 PC가 켜져 있는지, 작업 스케줄러가 동작하는지 확인하세요.",
+                )
+            else:
+                self._pass(
+                    "Operations",
+                    "Bot state",
+                    f"최근 리서치 {status}, 후보 {total_candidates}개, 전송 {recommendation_count}개, {age_hours:.1f}시간 전",
+                )
+        except Exception as exc:
+            self._warn("Operations", "Bot state", f"상태 파일 읽기 실패: {exc}", "cache/bot_state.json을 삭제 후 봇을 다시 실행하세요.")
 
     def _check_operating_scripts(self) -> None:
         scripts = [

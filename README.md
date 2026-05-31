@@ -108,6 +108,7 @@ KIS_BASE_URL=https://openapivts.koreainvestment.com:29443
 - KIS 계좌/모의투자/실전투자 설정과 현재가 조회
 - KRX/FDR 가격 데이터 품질
 - 전략 프로파일, 의사결정 등급, 자동매매 하위 점수 기준
+- 최근 봇 실행 상태(`cache/bot_state.json`)와 마지막 리서치 성공/실패 여부
 - 최근 백테스트 표본 수와 결과 파일 존재 여부
 
 텔레그램 테스트 메시지를 같이 보내려면 아래처럼 실행합니다.
@@ -172,6 +173,14 @@ AUTO_TRADE_CONFIRM_REAL_TRADING=YES
 데이터 신뢰도 검증은 기본적으로 켜져 있습니다. `STRICT_DATA_VALIDATION=true`이면 가격, 재무, 수급의 통합 데이터 신뢰도가 `MIN_DATA_QUALITY_SCORE` 미만인 종목은 추천/주문 후보에서 제외합니다. `ENABLE_PRICE_CROSSCHECK=true`이면 KIS 일봉과 FDR 일봉의 공통 거래일 종가를 비교해 차이가 `MAX_CROSS_SOURCE_CLOSE_DIFF_PCT`를 넘는지 확인합니다. 두 소스의 종가가 같더라도 최신 거래일이 다르면 경고를 남기고, FDR이 더 최신이면 최신 가격 기준을 우선 사용합니다.
 
 KIS 조회 API에서 일시적인 429/5xx 오류가 나면 `KIS_MAX_RETRIES`와 `KIS_RETRY_DELAY_SECONDS` 설정에 따라 재시도합니다. 실제 주문 전송 API는 중복 주문 방지를 위해 자동 재시도하지 않습니다.
+
+텔레그램 전송도 네트워크 지연이나 429 응답을 견디도록 재시도합니다.
+
+```text
+TELEGRAM_MAX_RETRIES=3
+TELEGRAM_RETRY_DELAY_SECONDS=2.0
+TELEGRAM_TIMEOUT_SECONDS=20.0
+```
 
 ## 전략 프로파일
 
@@ -257,6 +266,29 @@ notepad .env
 다른 PC에는 Git과 Python 3.11 이상이 먼저 설치되어 있어야 합니다. PC 로그인 시 자동 실행되게 하려면 `install_startup_task.bat`을 더블클릭하세요. 자동 실행을 제거하려면 `uninstall_startup_task.bat`을 사용합니다. 자동 실행 로그는 `logs/bot.log`에 저장되며, `logs/`는 Git에 올라가지 않습니다.
 
 상시 운영용 PC는 전원이 켜져 있고 Windows 사용자가 로그인되어 있어야 알림/감시가 계속 동작합니다. 절전 모드에 들어가면 봇도 멈추므로, 운영 PC의 전원 설정에서 절전 모드를 꺼두는 것을 권장합니다.
+
+## 운영 안정성 및 가시성
+
+봇은 중복 실행과 상태 미확인을 줄이기 위해 아래 운영 파일을 자동으로 관리합니다.
+
+- `logs/bot.log`: 콘솔과 별개로 남는 회전 로그 파일입니다. 파일이 커지면 자동으로 백업됩니다.
+- `cache/bot_state.json`: 최근 장마감 리서치, 실시간 스캔, 뉴스 스캔, 자동매매 실행 상태와 후보 수, 상위 추천 요약을 저장합니다.
+- `cache/*.lock`: 같은 작업이 중복 실행되지 않도록 막는 실행 락입니다. 오래된 락은 설정 시간 이후 자동 제거됩니다.
+
+중복 실행 방지 기본값은 아래와 같습니다.
+
+```text
+RUN_LOCK_STALE_MINUTES=180
+SCHEDULER_LOCK_STALE_MINUTES=720
+```
+
+현재 상태를 확인하려면 아래 명령을 실행하세요. `Bot state` 항목에서 마지막 리서치 성공/실패, 후보 수, 전송 수를 볼 수 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe operator_readiness.py --target alert --no-network
+```
+
+텔레그램 장마감 리포트 상단에는 전체 리서치 후보 수, 내부 감시 후보 수, 추천 컷 점수, 후보 분포가 표시됩니다. 상세 리포트는 `TOP 1~3`만 내려가므로 낮은 점수 후보가 추천처럼 섞이지 않습니다.
 
 ## 즉시 알림
 

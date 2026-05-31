@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
 from io import StringIO
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
@@ -28,6 +29,9 @@ from ta.volatility import AverageTrueRange
 # Telegram settings: fill these directly, or set TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env vars.
 TELEGRAM_TOKEN = ""
 CHAT_ID = ""
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_RETRY_DELAY_SECONDS = 2.0
+TELEGRAM_TIMEOUT_SECONDS = 20.0
 
 # Korea Investment Securities Open API settings.
 # Fill these directly, or set KIS_APP_KEY / KIS_APP_SECRET env vars.
@@ -49,6 +53,8 @@ MIN_HISTORY_DAYS = 80
 MAX_REPORTS = 20
 TELEGRAM_RECOMMENDATION_LIMIT = 3
 REQUEST_DELAY_SECONDS = 0.15
+RUN_LOCK_STALE_MINUTES = 180
+SCHEDULER_LOCK_STALE_MINUTES = 720
 KIS_DAILY_CHUNK_DAYS = 60
 FUNDAMENTAL_CACHE_DAYS = 7
 FAILURE_CACHE_DAYS = 3
@@ -264,6 +270,10 @@ MARKETS = {"KOSPI", "KOSDAQ"}
 EXCLUDE_NAME_KEYWORDS = ["스팩", "ETF", "ETN", "리츠"]
 EXCLUDE_DEPT_KEYWORDS = ["관리종목", "투자주의환기", "SPAC"]
 CACHE_DIR = Path("cache")
+LOG_DIR = Path("logs")
+BOT_LOG_FILE = LOG_DIR / "bot.log"
+BOT_LOG_MAX_BYTES = 2_000_000
+BOT_LOG_BACKUP_COUNT = 5
 FUNDAMENTAL_CACHE_FILE = CACHE_DIR / "fundamentals.json"
 ALERT_CACHE_FILE = CACHE_DIR / "alerts.json"
 KIS_TOKEN_CACHE_FILE = CACHE_DIR / "kis_token.json"
@@ -272,12 +282,49 @@ TRADE_HISTORY_FILE = CACHE_DIR / "trade_history.json"
 REALTIME_CANDIDATE_FILE = CACHE_DIR / "realtime_candidates.json"
 REALTIME_ALERT_FILE = CACHE_DIR / "realtime_alerts.json"
 NEWS_ALERT_FILE = CACHE_DIR / "news_alerts.json"
+BOT_STATE_FILE = CACHE_DIR / "bot_state.json"
+SCHEDULER_LOCK_FILE = CACHE_DIR / "scheduler.lock"
+SCAN_LOCK_FILE = CACHE_DIR / "research_scan.lock"
+REALTIME_LOCK_FILE = CACHE_DIR / "realtime_scan.lock"
+NEWS_LOCK_FILE = CACHE_DIR / "news_scan.lock"
+TRADING_LOCK_FILE = CACHE_DIR / "trading.lock"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+
+def configure_logging() -> None:
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if not root_logger.handlers:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        root_logger.addHandler(stream_handler)
+
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        log_path = str(BOT_LOG_FILE.resolve())
+        has_file_handler = any(
+            isinstance(handler, RotatingFileHandler)
+            and getattr(handler, "baseFilename", "") == log_path
+            for handler in root_logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = RotatingFileHandler(
+                BOT_LOG_FILE,
+                maxBytes=BOT_LOG_MAX_BYTES,
+                backupCount=BOT_LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+    except Exception as exc:
+        root_logger.warning("파일 로그 설정 실패: %s", exc)
+
+
+configure_logging()
 logger = logging.getLogger("financial-health-scanner")
 
 
@@ -521,6 +568,141 @@ class KrxFundamental:
     bps: Optional[float]
     roe: Optional[float]
     source_date: str
+
+
+class BotLockError(RuntimeError):
+    pass
+
+
+class BotRunLock:
+    def __init__(self, path: Path, name: str, stale_minutes: Optional[float] = None) -> None:
+        self.path = path
+        self.name = name
+        self.stale_minutes = stale_minutes if stale_minutes is not None else RUN_LOCK_STALE_MINUTES
+        self.token = f"{os.getpid()}:{time.time()}"
+
+    def __enter__(self) -> "BotRunLock":
+        CACHE_DIR.mkdir(exist_ok=True)
+        payload = {
+            "name": self.name,
+            "pid": os.getpid(),
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "token": self.token,
+        }
+        for _ in range(2):
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w", encoding="utf-8") as file:
+                    json.dump(payload, file, ensure_ascii=False, indent=2)
+                return self
+            except FileExistsError:
+                if self._remove_if_stale():
+                    continue
+                lock_info = self._read_lock_info()
+                started_at = lock_info.get("started_at", "unknown")
+                pid = lock_info.get("pid", "unknown")
+                raise BotLockError(f"{self.name} 작업이 이미 실행 중입니다. pid={pid}, started_at={started_at}")
+        raise BotLockError(f"{self.name} 실행 락을 확보하지 못했습니다.")
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        try:
+            lock_info = self._read_lock_info()
+            if lock_info.get("token") == self.token:
+                self.path.unlink(missing_ok=True)
+        except Exception as cleanup_exc:
+            logger.debug("%s 락 정리 실패: %s", self.name, cleanup_exc)
+
+    def _remove_if_stale(self) -> bool:
+        lock_info = self._read_lock_info()
+        started_at_text = str(lock_info.get("started_at", ""))
+        try:
+            started_at = datetime.fromisoformat(started_at_text)
+        except ValueError:
+            started_at = datetime.fromtimestamp(self.path.stat().st_mtime)
+        age_minutes = (datetime.now() - started_at).total_seconds() / 60
+        if age_minutes < max(1.0, self.stale_minutes):
+            return False
+        logger.warning("%s 오래된 실행 락 제거: %.1f분 경과", self.name, age_minutes)
+        self.path.unlink(missing_ok=True)
+        return True
+
+    def _read_lock_info(self) -> Dict[str, object]:
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+
+class OperationStateStore:
+    def __init__(self, path: Path = BOT_STATE_FILE) -> None:
+        self.path = path
+
+    def start_job(self, job_name: str, details: Optional[Dict[str, object]] = None) -> datetime:
+        started_at = datetime.now()
+        state = self._load()
+        jobs = state.setdefault("jobs", {})
+        jobs[job_name] = {
+            "status": "running",
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "updated_at": started_at.isoformat(timespec="seconds"),
+            "details": details or {},
+        }
+        state["heartbeat_at"] = started_at.isoformat(timespec="seconds")
+        self._save(state)
+        return started_at
+
+    def finish_job(
+        self,
+        job_name: str,
+        started_at: datetime,
+        status: str,
+        details: Optional[Dict[str, object]] = None,
+    ) -> None:
+        finished_at = datetime.now()
+        state = self._load()
+        jobs = state.setdefault("jobs", {})
+        jobs[job_name] = {
+            "status": status,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "updated_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round((finished_at - started_at).total_seconds(), 1),
+            "details": details or {},
+        }
+        state["heartbeat_at"] = finished_at.isoformat(timespec="seconds")
+        self._save(state)
+
+    def heartbeat(self, details: Optional[Dict[str, object]] = None) -> None:
+        now = datetime.now()
+        state = self._load()
+        state["heartbeat_at"] = now.isoformat(timespec="seconds")
+        state["process"] = {
+            "pid": os.getpid(),
+            "updated_at": now.isoformat(timespec="seconds"),
+            "details": details or {},
+        }
+        self._save(state)
+
+    def _load(self) -> Dict[str, object]:
+        if not self.path.exists():
+            return {"version": 1, "jobs": {}}
+        try:
+            with self.path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+            return payload if isinstance(payload, dict) else {"version": 1, "jobs": {}}
+        except Exception as exc:
+            logger.warning("운영 상태 파일 로드 실패: %s", exc)
+            return {"version": 1, "jobs": {}}
+
+    def _save(self, state: Dict[str, object]) -> None:
+        try:
+            CACHE_DIR.mkdir(exist_ok=True)
+            with self.path.open("w", encoding="utf-8") as file:
+                json.dump(state, file, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logger.warning("운영 상태 파일 저장 실패: %s", exc)
 
 
 class KrxFundamentalProvider:
@@ -2907,8 +3089,12 @@ class Notifier:
     MAX_MESSAGE_LENGTH = 3900
 
     def __init__(self, token: str, chat_id: str) -> None:
+        load_dotenv()
         self.token = token
         self.chat_id = chat_id
+        self.max_retries = max(1, env_int("TELEGRAM_MAX_RETRIES", TELEGRAM_MAX_RETRIES))
+        self.retry_delay_seconds = max(0.1, env_float("TELEGRAM_RETRY_DELAY_SECONDS", TELEGRAM_RETRY_DELAY_SECONDS))
+        self.timeout_seconds = max(3.0, env_float("TELEGRAM_TIMEOUT_SECONDS", TELEGRAM_TIMEOUT_SECONDS))
 
     def send(self, message: str) -> bool:
         if not self.token or not self.chat_id:
@@ -2916,26 +3102,65 @@ class Notifier:
             logger.info("전송 예정 메시지:\n%s", message)
             return False
 
-        try:
-            for chunk in self._split_message(message):
+        for index, chunk in enumerate(self._split_message(message), start=1):
+            if not self._send_chunk(chunk, index):
+                return False
+
+        logger.info("텔레그램 메시지 전송 완료")
+        return True
+
+    def _send_chunk(self, chunk: str, index: int) -> bool:
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        last_status = "N/A"
+        for attempt in range(1, self.max_retries + 1):
+            try:
                 response = requests.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    url,
                     data={
                         "chat_id": self.chat_id,
                         "text": chunk,
                         "disable_web_page_preview": True,
                     },
-                    timeout=20,
+                    timeout=self.timeout_seconds,
                 )
+                last_status = response.status_code
                 response.raise_for_status()
-        except requests.RequestException as exc:
-            response = getattr(exc, "response", None)
-            status = getattr(response, "status_code", "N/A")
-            logger.error("텔레그램 메시지 전송 실패: HTTP %s", status)
-            return False
+                return True
+            except requests.RequestException as exc:
+                response = getattr(exc, "response", None)
+                last_status = getattr(response, "status_code", last_status)
+                retry_after = self._retry_after_seconds(response)
+                if attempt >= self.max_retries:
+                    logger.error(
+                        "텔레그램 메시지 전송 실패: chunk=%d, HTTP %s, attempts=%d",
+                        index,
+                        last_status,
+                        attempt,
+                    )
+                    return False
+                delay = retry_after or self.retry_delay_seconds * attempt
+                logger.warning(
+                    "텔레그램 전송 재시도: chunk=%d, HTTP %s, attempt=%d/%d, %.1f초 대기",
+                    index,
+                    last_status,
+                    attempt,
+                    self.max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+        return False
 
-        logger.info("텔레그램 메시지 전송 완료")
-        return True
+    @staticmethod
+    def _retry_after_seconds(response: Optional[requests.Response]) -> Optional[float]:
+        if response is None:
+            return None
+        retry_after = response.headers.get("Retry-After")
+        if not retry_after:
+            return None
+        try:
+            return max(0.1, float(retry_after))
+        except ValueError:
+            return None
 
     def _split_message(self, message: str) -> List[str]:
         if len(message) <= self.MAX_MESSAGE_LENGTH:
@@ -3905,20 +4130,33 @@ class FinancialHealthBot:
         self.realtime_scanner = RealtimeScanner(self.kis_provider, self.notifier)
         self.news_monitor = NewsPulseMonitor(self.notifier)
         self.alert_cache: Dict[str, str] = self._load_alert_cache()
+        self.state_store = OperationStateStore()
 
     def run_once(self) -> None:
         logger.info("재무 건전성 종목 발굴 작업 시작")
+        started_at = self.state_store.start_job(
+            "daily_research",
+            {"recommendation_limit": telegram_recommendation_limit()},
+        )
         try:
-            reports, regimes = self._discover_reports(send_immediate_alerts=False)
+            with BotRunLock(SCAN_LOCK_FILE, "daily_research"):
+                reports, regimes = self._discover_reports(send_immediate_alerts=False)
             market_regime = regimes["KOSPI"]
             if not any(regime.risk_on for regime in regimes.values()):
                 logger.info("Risk-Off 국면이므로 매수 후보 스캔을 중단합니다.")
                 self.notifier.send(self._build_risk_off_message(market_regime))
+                self.state_store.finish_job(
+                    "daily_research",
+                    started_at,
+                    "risk_off",
+                    {"market_regime": market_regime.summary},
+                )
                 return
 
             ranked_reports = self._rank_reports(reports)
             research_pool = ranked_reports[:MAX_REPORTS]
             recommendations = self._top_recommendations(ranked_reports)
+            research_summary = self._build_research_summary(ranked_reports, research_pool, recommendations)
             self.realtime_scanner.save_candidate_pool(research_pool, regimes)
             order_plans = self.trading_engine.prepare_buy_plans(recommendations, market_regime)
             self.trading_engine.save_pending_plans(order_plans)
@@ -3930,22 +4168,33 @@ class FinancialHealthBot:
                     trading_status=self.trading_engine.status_summary(),
                     researched_count=len(ranked_reports),
                     research_pool_count=len(research_pool),
+                    research_summary=research_summary,
                 )
             )
             self._save_alert_cache()
+            self.state_store.finish_job("daily_research", started_at, "success", research_summary)
             logger.info(
                 "재무 건전성 종목 발굴 작업 완료. 전체 후보: %d개, 전송 추천: %d개",
                 len(ranked_reports),
                 len(recommendations),
             )
+        except BotLockError as exc:
+            logger.warning("재무 건전성 종목 발굴 작업 건너뜀: %s", exc)
+            self.state_store.finish_job("daily_research", started_at, "skipped", {"reason": str(exc)})
         except Exception as exc:
             logger.exception("재무 건전성 종목 발굴 작업 실패: %s", exc)
+            self.state_store.finish_job("daily_research", started_at, "failed", {"error": str(exc)})
             self.notifier.send(f"⚠️ 재무 건전성 스캐너 오류\n{exc}")
 
     def prepare_realtime_candidates(self) -> None:
         logger.info("실시간 감시 후보군 준비 시작")
+        started_at = self.state_store.start_job(
+            "candidate_preparation",
+            {"watchlist_limit": self.realtime_scanner.max_watchlist},
+        )
         try:
-            reports, regimes = self._discover_reports(send_immediate_alerts=False)
+            with BotRunLock(SCAN_LOCK_FILE, "candidate_preparation"):
+                reports, regimes = self._discover_reports(send_immediate_alerts=False)
             ranked_reports = self._rank_reports(reports)
             watchlist_reports = ranked_reports[: self.realtime_scanner.max_watchlist]
             self.realtime_scanner.save_candidate_pool(watchlist_reports, regimes)
@@ -3962,37 +4211,103 @@ class FinancialHealthBot:
                 len(ranked_reports),
                 len(watchlist_reports),
             )
+            self.state_store.finish_job(
+                "candidate_preparation",
+                started_at,
+                "success",
+                self._build_research_summary(
+                    ranked_reports,
+                    watchlist_reports,
+                    self._top_recommendations(ranked_reports),
+                ),
+            )
+        except BotLockError as exc:
+            logger.warning("실시간 감시 후보군 준비 건너뜀: %s", exc)
+            self.state_store.finish_job("candidate_preparation", started_at, "skipped", {"reason": str(exc)})
         except Exception as exc:
             logger.exception("실시간 감시 후보군 준비 실패: %s", exc)
+            self.state_store.finish_job("candidate_preparation", started_at, "failed", {"error": str(exc)})
             self.notifier.send(f"⚠️ 실시간 후보군 준비 오류\n{exc}")
 
     def run_realtime_once(self, force: bool = False) -> None:
+        started_at = self.state_store.start_job("realtime_scan", {"force": force})
         try:
-            regimes = self.market_regime_filter.analyze_by_market()
-            self.realtime_scanner.scan_once(regimes, force=force)
+            now = datetime.now()
+            if (
+                not force
+                and (
+                    not self.realtime_scanner.enabled
+                    or not is_time_between(now, self.realtime_scanner.scan_start, self.realtime_scanner.scan_end)
+                )
+            ):
+                self.state_store.finish_job(
+                    "realtime_scan",
+                    started_at,
+                    "skipped",
+                    {"reason": "outside_realtime_window"},
+                )
+                return
+            with BotRunLock(REALTIME_LOCK_FILE, "realtime_scan", stale_minutes=30):
+                regimes = self.market_regime_filter.analyze_by_market()
+                signals = self.realtime_scanner.scan_once(regimes, force=force)
+            self.state_store.finish_job(
+                "realtime_scan",
+                started_at,
+                "success",
+                {"signals": len(signals)},
+            )
+        except BotLockError as exc:
+            logger.debug("실시간 스캔 건너뜀: %s", exc)
+            self.state_store.finish_job("realtime_scan", started_at, "skipped", {"reason": str(exc)})
         except Exception as exc:
             logger.exception("실시간 스캔 실패: %s", exc)
+            self.state_store.finish_job("realtime_scan", started_at, "failed", {"error": str(exc)})
             self.notifier.send(f"⚠️ 실시간 스캔 오류\n{exc}")
 
     def run_news_once(self, force: bool = False) -> None:
+        started_at = self.state_store.start_job("news_scan", {"force": force})
         try:
-            self.news_monitor.scan_once(force=force)
+            with BotRunLock(NEWS_LOCK_FILE, "news_scan", stale_minutes=30):
+                impacts = self.news_monitor.scan_once(force=force)
+            self.state_store.finish_job("news_scan", started_at, "success", {"impacts": len(impacts)})
+        except BotLockError as exc:
+            logger.debug("뉴스 속보 감시 건너뜀: %s", exc)
+            self.state_store.finish_job("news_scan", started_at, "skipped", {"reason": str(exc)})
         except Exception as exc:
             logger.exception("뉴스 속보 감시 실패: %s", exc)
+            self.state_store.finish_job("news_scan", started_at, "failed", {"error": str(exc)})
             self.notifier.send(f"⚠️ 뉴스 속보 감시 오류\n{exc}")
 
     def run_trading_once(self) -> None:
         logger.info("자동매매 대기 주문 실행 시작")
+        started_at = self.state_store.start_job("trading_execution")
         try:
-            market_regime = self.market_regime_filter.analyze()
-            if not market_regime.risk_on:
-                self.trading_engine.discard_pending_plans(
-                    f"시장 국면이 Risk-Off입니다. {market_regime.summary}"
-                )
-                return
-            self.trading_engine.execute_pending_orders()
+            with BotRunLock(TRADING_LOCK_FILE, "trading_execution", stale_minutes=60):
+                market_regime = self.market_regime_filter.analyze()
+                if not market_regime.risk_on:
+                    self.trading_engine.discard_pending_plans(
+                        f"시장 국면이 Risk-Off입니다. {market_regime.summary}"
+                    )
+                    self.state_store.finish_job(
+                        "trading_execution",
+                        started_at,
+                        "risk_off",
+                        {"market_regime": market_regime.summary},
+                    )
+                    return
+                results = self.trading_engine.execute_pending_orders()
+            self.state_store.finish_job(
+                "trading_execution",
+                started_at,
+                "success",
+                {"orders": len(results)},
+            )
+        except BotLockError as exc:
+            logger.warning("자동매매 실행 건너뜀: %s", exc)
+            self.state_store.finish_job("trading_execution", started_at, "skipped", {"reason": str(exc)})
         except Exception as exc:
             logger.exception("자동매매 대기 주문 실행 실패: %s", exc)
+            self.state_store.finish_job("trading_execution", started_at, "failed", {"error": str(exc)})
             self.notifier.send(f"⚠️ 자동매매 실행 오류\n{exc}")
 
     def _discover_reports(self, send_immediate_alerts: bool) -> tuple[List[DiscoveryReport], Dict[str, MarketRegime]]:
@@ -4285,6 +4600,54 @@ class FinancialHealthBot:
         return FinancialHealthBot._rank_reports(reports)[:telegram_recommendation_limit()]
 
     @staticmethod
+    def _build_research_summary(
+        ranked_reports: List[DiscoveryReport],
+        research_pool: List[DiscoveryReport],
+        recommendations: List[DiscoveryReport],
+    ) -> Dict[str, object]:
+        stage_counts = {"strict": 0, "watchlist": 0, "radar": 0}
+        decision_counts: Dict[str, int] = {}
+        scores = [report.score.total for report in ranked_reports if report.score is not None]
+        for report in ranked_reports:
+            stage = report.signal_stage if report.signal_stage in stage_counts else "strict"
+            stage_counts[stage] += 1
+            tier = report.decision.tier if report.decision else "N/A"
+            decision_counts[tier] = decision_counts.get(tier, 0) + 1
+        cutoff_score = recommendations[-1].score.total if recommendations and recommendations[-1].score else None
+        return {
+            "total_candidates": len(ranked_reports),
+            "research_pool_count": len(research_pool),
+            "recommendation_count": len(recommendations),
+            "recommendation_limit": telegram_recommendation_limit(),
+            "stage_counts": stage_counts,
+            "decision_counts": decision_counts,
+            "highest_score": round(max(scores), 1) if scores else None,
+            "lowest_score": round(min(scores), 1) if scores else None,
+            "cutoff_score": round(cutoff_score, 1) if cutoff_score is not None else None,
+            "top_recommendations": [
+                FinancialHealthBot._report_summary(report, rank)
+                for rank, report in enumerate(recommendations, start=1)
+            ],
+        }
+
+    @staticmethod
+    def _report_summary(report: DiscoveryReport, rank: int) -> Dict[str, object]:
+        return {
+            "rank": rank,
+            "code": report.stock.code,
+            "name": report.stock.name,
+            "stage": report.signal_stage,
+            "stage_label": format_discovery_stage(report.signal_stage),
+            "decision": report.decision.tier if report.decision else "N/A",
+            "score": round(report.score.total, 1) if report.score else None,
+            "thesis": round(report.thesis.total, 1) if report.thesis else None,
+            "data_quality": round(report.data_quality_score, 1),
+            "rsi": round(report.technicals.rsi, 1),
+            "relative_strength_60d": round(report.technicals.relative_strength_60d, 1),
+            "pbr": round(report.financials.pbr, 2),
+        }
+
+    @staticmethod
     def _build_reason(metrics: FinancialMetrics, technicals: TechnicalSnapshot) -> str:
         margin_text = "영업이익률 확인 가능"
         if metrics.operating_margin is not None:
@@ -4305,6 +4668,7 @@ class FinancialHealthBot:
         trading_status: str = "",
         researched_count: Optional[int] = None,
         research_pool_count: Optional[int] = None,
+        research_summary: Optional[Dict[str, object]] = None,
     ) -> str:
         today = datetime.now().strftime("%Y-%m-%d")
         total_researched = researched_count if researched_count is not None else len(reports)
@@ -4326,17 +4690,20 @@ class FinancialHealthBot:
             f"🏆 텔레그램 추천: 종합점수 상위 {len(reports)}개 / 표시 한도 {recommendation_limit}개",
             "🔢 정렬 기준: 종합점수 높은 순",
         ]
+        summary_lines = format_research_summary(research_summary)
+        if summary_lines:
+            lines.extend(summary_lines)
         if research_pool_count is not None and research_pool_count > len(reports):
             lines.append(f"📁 내부 감시/캐시 보관: 상위 {research_pool_count}개")
 
-        for report in reports:
+        for rank, report in enumerate(reports, start=1):
             financials = report.financials
             technicals = report.technicals
             accumulation = report.accumulation
             lines.extend(
                 [
                     "",
-                    f"💎 [{report.stock.name}({report.stock.code})] 발굴 리포트",
+                    f"🏆 TOP {rank} [{report.stock.name}({report.stock.code})] 발굴 리포트",
                     f"🪜 후보 단계: {format_discovery_stage(report.signal_stage)}",
                     f"⭐ 종합점수: {format_factor_score(report.score)}",
                     f"🧠 투자 가설: {format_investment_thesis(report.thesis)}",
@@ -4523,6 +4890,32 @@ def format_investment_thesis(thesis: Optional[InvestmentThesis]) -> str:
     if thesis.concerns:
         text += " / 주의: " + " · ".join(thesis.concerns[:2])
     return text
+
+
+def format_research_summary(summary: Optional[Dict[str, object]]) -> List[str]:
+    if not summary:
+        return []
+    stage_counts = summary.get("stage_counts")
+    score_text = "점수 범위 N/A"
+    highest_score = summary.get("highest_score")
+    cutoff_score = summary.get("cutoff_score")
+    lowest_score = summary.get("lowest_score")
+    if highest_score is not None and cutoff_score is not None and lowest_score is not None:
+        score_text = f"최고 {highest_score}, 추천 컷 {cutoff_score}, 전체 최저 {lowest_score}"
+
+    lines = [f"📊 점수 범위: {score_text}"]
+    if isinstance(stage_counts, dict):
+        lines.append(
+            "🧮 후보 분포: "
+            f"정규 {int(stage_counts.get('strict', 0))} / "
+            f"관찰 {int(stage_counts.get('watchlist', 0))} / "
+            f"레이더 {int(stage_counts.get('radar', 0))}"
+        )
+    decision_counts = summary.get("decision_counts")
+    if isinstance(decision_counts, dict) and decision_counts:
+        ordered = sorted(decision_counts.items(), key=lambda item: str(item[0]))
+        lines.append("🧭 판단 분포: " + " / ".join(f"{key} {value}" for key, value in ordered[:5]))
+    return lines
 
 
 def decision_rank(decision: Optional[SignalDecision]) -> int:
@@ -4937,41 +5330,56 @@ def run_trading_job(bot: FinancialHealthBot) -> None:
 
 
 def main() -> None:
-    bot = FinancialHealthBot()
-    logger.info("재무 건전성 중심 종목 발굴 봇 시작")
-    logger.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
-    logger.info(
-        "실시간 감시는 %s 후보 준비 후 %s~%s, %d초 간격으로 실행합니다.",
-        bot.realtime_scanner.candidate_run_time,
-        bot.realtime_scanner.scan_start,
-        bot.realtime_scanner.scan_end,
-        bot.realtime_scanner.scan_interval_seconds,
-    )
-    logger.info("자동매매 대기 주문은 매일 한국 시간 기준 %s에 실행합니다.", bot.trading_engine.run_time)
-    logger.info(
-        "뉴스 속보 감시는 %s, %d초 간격으로 실행합니다.",
-        "활성화" if bot.news_monitor.enabled else "비활성화",
-        bot.news_monitor.scan_interval_seconds,
-    )
+    try:
+        scheduler_stale_minutes = env_float("SCHEDULER_LOCK_STALE_MINUTES", SCHEDULER_LOCK_STALE_MINUTES)
+        with BotRunLock(SCHEDULER_LOCK_FILE, "scheduler", stale_minutes=scheduler_stale_minutes):
+            bot = FinancialHealthBot()
+            logger.info("재무 건전성 중심 종목 발굴 봇 시작")
+            logger.info("매일 한국 시간 기준 %s에 분석을 실행합니다.", RUN_TIME_KST)
+            logger.info(
+                "실시간 감시는 %s 후보 준비 후 %s~%s, %d초 간격으로 실행합니다.",
+                bot.realtime_scanner.candidate_run_time,
+                bot.realtime_scanner.scan_start,
+                bot.realtime_scanner.scan_end,
+                bot.realtime_scanner.scan_interval_seconds,
+            )
+            logger.info("자동매매 대기 주문은 매일 한국 시간 기준 %s에 실행합니다.", bot.trading_engine.run_time)
+            logger.info(
+                "뉴스 속보 감시는 %s, %d초 간격으로 실행합니다.",
+                "활성화" if bot.news_monitor.enabled else "비활성화",
+                bot.news_monitor.scan_interval_seconds,
+            )
 
-    schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
-    schedule.every().day.at(bot.realtime_scanner.candidate_run_time).do(run_candidate_job, bot)
-    schedule.every(bot.realtime_scanner.scan_interval_seconds).seconds.do(run_realtime_job, bot)
-    schedule.every(bot.news_monitor.scan_interval_seconds).seconds.do(run_news_job, bot)
-    schedule.every().day.at(bot.trading_engine.run_time).do(run_trading_job, bot)
-    run_scheduled_job(bot)
-    run_news_job(bot)
+            schedule.every().day.at(RUN_TIME_KST).do(run_scheduled_job, bot)
+            schedule.every().day.at(bot.realtime_scanner.candidate_run_time).do(run_candidate_job, bot)
+            schedule.every(bot.realtime_scanner.scan_interval_seconds).seconds.do(run_realtime_job, bot)
+            schedule.every(bot.news_monitor.scan_interval_seconds).seconds.do(run_news_job, bot)
+            schedule.every().day.at(bot.trading_engine.run_time).do(run_trading_job, bot)
+            bot.state_store.heartbeat({"status": "scheduler_started"})
+            run_scheduled_job(bot)
+            run_news_job(bot)
 
-    while True:
-        try:
-            schedule.run_pending()
-            time.sleep(30)
-        except KeyboardInterrupt:
-            logger.info("사용자 요청으로 봇을 종료합니다.")
-            break
-        except Exception as exc:
-            logger.exception("스케줄 루프 오류: %s", exc)
-            time.sleep(60)
+            while True:
+                try:
+                    schedule.run_pending()
+                    bot.state_store.heartbeat(
+                        {
+                            "status": "scheduler_running",
+                            "next_jobs": [str(job) for job in schedule.jobs[:8]],
+                        }
+                    )
+                    time.sleep(30)
+                except KeyboardInterrupt:
+                    logger.info("사용자 요청으로 봇을 종료합니다.")
+                    bot.state_store.heartbeat({"status": "scheduler_stopped"})
+                    break
+                except Exception as exc:
+                    logger.exception("스케줄 루프 오류: %s", exc)
+                    bot.state_store.heartbeat({"status": "scheduler_error", "error": str(exc)})
+                    time.sleep(60)
+    except BotLockError as exc:
+        logger.error("봇이 이미 실행 중입니다: %s", exc)
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
