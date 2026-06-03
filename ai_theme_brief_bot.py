@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -28,6 +29,11 @@ AI_THEME_BRIEF_MAX_NEWS_PER_SYMBOL = 1
 AI_THEME_BRIEF_MAX_TOTAL_NEWS = 12
 AI_THEME_BRIEF_REQUEST_DELAY_SECONDS = 0.2
 AI_THEME_BRIEF_PRICE_PERIOD = "1mo"
+AI_THEME_BRIEF_NEWS_SOURCES = "yahoo,google"
+AI_THEME_BRIEF_TRANSLATE_NEWS = True
+AI_THEME_BRIEF_TRANSLATION_PROVIDER = "mymemory"
+AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS = 8.0
+AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS = 220
 AI_THEME_BRIEF_CACHE_FILE = Path("cache") / "ai_theme_brief_latest.json"
 AI_THEME_BRIEF_LOG_FILE = Path("logs") / "ai_theme_brief.log"
 
@@ -73,6 +79,10 @@ class NewsItem:
     sentiment: str
     impact_score: float
     matched_terms: List[str] = field(default_factory=list)
+    provider: str = ""
+    original_title: str = ""
+    original_description: str = ""
+    summary_ko: str = ""
 
 
 AI_THEME_STOCKS: List[ThemeStock] = [
@@ -103,6 +113,29 @@ PRIVATE_OR_INDIRECT = [
     "Agility Robotics: 비상장, 직접 매수 가능한 상장 티커 없음",
     "Boston Dynamics: 비상장, 현대차(005380.KS)를 간접 노출로 추적",
 ]
+
+
+STOCK_NEWS_ALIASES: Dict[str, List[str]] = {
+    "NVDA": ["nvidia", "nvda"],
+    "MRVL": ["marvell", "marvell technology", "mrvl"],
+    "CRWV": ["coreweave", "crwv"],
+    "NOW": ["servicenow", "service now"],
+    "CRM": ["salesforce", "crm"],
+    "SAP": ["sap"],
+    "PLTR": ["palantir", "pltr"],
+    "MSFT": ["microsoft", "msft", "windows", "copilot"],
+    "2454.TW": ["mediatek", "media tek"],
+    "005380.KS": ["hyundai", "hyundai motor", "boston dynamics"],
+    "SIE.DE": ["siemens"],
+    "2317.TW": ["foxconn", "hon hai"],
+    "2382.TW": ["quanta", "quanta computer"],
+    "3231.TW": ["wistron"],
+    "2356.TW": ["inventec"],
+    "4938.TW": ["pegatron"],
+    "SMCI": ["supermicro", "super micro", "smci"],
+    "2357.TW": ["asus", "asustek"],
+    "2376.TW": ["gigabyte", "gigabyte technology"],
+}
 
 
 POSITIVE_TERMS = [
@@ -196,6 +229,7 @@ def configure_console_encoding() -> None:
 
 class AIThemeBriefBot:
     GOOGLE_NEWS_URL = "https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
+    YAHOO_FINANCE_RSS_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
 
     def __init__(self, dry_run: bool = False) -> None:
         self.dry_run = dry_run
@@ -205,6 +239,20 @@ class AIThemeBriefBot:
         self.max_total_news = env_int("AI_THEME_BRIEF_MAX_TOTAL_NEWS", AI_THEME_BRIEF_MAX_TOTAL_NEWS)
         self.request_delay = env_float("AI_THEME_BRIEF_REQUEST_DELAY_SECONDS", AI_THEME_BRIEF_REQUEST_DELAY_SECONDS)
         self.price_period = os.getenv("AI_THEME_BRIEF_PRICE_PERIOD", AI_THEME_BRIEF_PRICE_PERIOD)
+        self.news_sources = env_list("AI_THEME_BRIEF_NEWS_SOURCES", AI_THEME_BRIEF_NEWS_SOURCES)
+        self.translate_news = env_bool("AI_THEME_BRIEF_TRANSLATE_NEWS", AI_THEME_BRIEF_TRANSLATE_NEWS)
+        self.translation_provider = os.getenv(
+            "AI_THEME_BRIEF_TRANSLATION_PROVIDER",
+            AI_THEME_BRIEF_TRANSLATION_PROVIDER,
+        ).strip().lower()
+        self.translation_timeout = env_float(
+            "AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS",
+            AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS,
+        )
+        self.news_summary_max_chars = env_int(
+            "AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS",
+            AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS,
+        )
         self.telegram = TelegramClient(
             token=TELEGRAM_TOKEN or os.getenv("TELEGRAM_TOKEN", ""),
             chat_id=TELEGRAM_CHAT_ID or os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -263,38 +311,139 @@ class AIThemeBriefBot:
         return snapshot
 
     def fetch_news(self, stock: ThemeStock) -> List[NewsItem]:
-        query = f"{stock.news_query} stock OR shares"
-        url = self.GOOGLE_NEWS_URL.format(query=quote_plus(query))
-        cutoff = datetime.now() - timedelta(hours=max(1, self.news_lookback_hours))
         items: List[NewsItem] = []
+        if "yahoo" in self.news_sources:
+            items.extend(self.fetch_yahoo_news(stock))
+            time.sleep(self.request_delay)
+        if "google" in self.news_sources:
+            items.extend(self.fetch_google_news(stock))
+        deduped = dedupe_news_items(items)
+        return sorted(deduped, key=lambda item: (item.impact_score, item.published_at), reverse=True)
+
+    def fetch_yahoo_news(self, stock: ThemeStock) -> List[NewsItem]:
+        url = self.YAHOO_FINANCE_RSS_URL.format(symbol=quote_plus(stock.symbol))
+        cutoff = datetime.now() - timedelta(hours=max(1, self.news_lookback_hours))
+        candidates: List[dict] = []
         try:
             response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
             response.raise_for_status()
             root = ET.fromstring(response.content)
             for item in root.findall(".//item"):
-                title = unescape((item.findtext("title") or "").strip())
+                title = normalize_news_title(item.findtext("title") or "")
+                description = clean_html_text(item.findtext("description") or "")
                 link = (item.findtext("link") or "").strip()
                 published_at = parse_news_datetime(item.findtext("pubDate") or "")
-                if published_at < cutoff:
+                if published_at < cutoff or not title:
                     continue
-                sentiment, impact_score, matched_terms = score_news_title(title)
-                items.append(
-                    NewsItem(
-                        symbol=stock.symbol,
-                        name_ko=stock.name_ko,
-                        theme=stock.theme,
-                        title=title,
-                        source=(item.findtext("source") or "Google News").strip(),
-                        published_at=published_at.isoformat(timespec="seconds"),
-                        link=link,
-                        sentiment=sentiment,
-                        impact_score=impact_score,
-                        matched_terms=matched_terms,
-                    )
+                if not is_relevant_news(stock, title, description):
+                    continue
+                source = (item.findtext("source") or "Yahoo Finance").strip()
+                _, impact_score, _ = score_news_title(f"{title} {description}")
+                candidates.append(
+                    {
+                        "title": title,
+                        "description": description,
+                        "source": source,
+                        "published_at": published_at,
+                        "link": link,
+                        "provider": "Yahoo Finance",
+                        "impact_score": impact_score,
+                    }
                 )
         except Exception as exc:
-            logger.debug("%s(%s) 뉴스 조회 실패: %s", stock.name_ko, stock.symbol, exc)
-        return items
+            logger.debug("%s(%s) Yahoo Finance 뉴스 조회 실패: %s", stock.name_ko, stock.symbol, exc)
+        return self.build_top_news_items(stock, candidates)
+
+    def fetch_google_news(self, stock: ThemeStock) -> List[NewsItem]:
+        query = f"{stock.news_query} stock OR shares"
+        url = self.GOOGLE_NEWS_URL.format(query=quote_plus(query))
+        cutoff = datetime.now() - timedelta(hours=max(1, self.news_lookback_hours))
+        candidates: List[dict] = []
+        try:
+            response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+            for item in root.findall(".//item"):
+                source = (item.findtext("source") or "Google News").strip()
+                title = normalize_news_title(item.findtext("title") or "", source)
+                description = clean_html_text(item.findtext("description") or "")
+                link = (item.findtext("link") or "").strip()
+                published_at = parse_news_datetime(item.findtext("pubDate") or "")
+                if published_at < cutoff or not title:
+                    continue
+                if not is_relevant_news(stock, title, description):
+                    continue
+                _, impact_score, _ = score_news_title(f"{title} {description}")
+                candidates.append(
+                    {
+                        "title": title,
+                        "description": description,
+                        "source": source,
+                        "published_at": published_at,
+                        "link": link,
+                        "provider": "Google News",
+                        "impact_score": impact_score,
+                    }
+                )
+        except Exception as exc:
+            logger.debug("%s(%s) Google News 뉴스 조회 실패: %s", stock.name_ko, stock.symbol, exc)
+        return self.build_top_news_items(stock, candidates)
+
+    def build_top_news_items(self, stock: ThemeStock, candidates: List[dict]) -> List[NewsItem]:
+        limit = max(1, self.max_news_per_symbol)
+        ranked = sorted(candidates, key=lambda item: (item["impact_score"], item["published_at"]), reverse=True)
+        return [
+            self.build_news_item(
+                stock=stock,
+                title=str(candidate["title"]),
+                description=str(candidate["description"]),
+                source=str(candidate["source"]),
+                published_at=candidate["published_at"],
+                link=str(candidate["link"]),
+                provider=str(candidate["provider"]),
+            )
+            for candidate in ranked[:limit]
+        ]
+
+    def build_news_item(
+        self,
+        stock: ThemeStock,
+        title: str,
+        description: str,
+        source: str,
+        published_at: datetime,
+        link: str,
+        provider: str,
+    ) -> NewsItem:
+        scoring_text = f"{title} {description}"
+        sentiment, impact_score, matched_terms = score_news_title(scoring_text)
+        summary = summarize_news_to_korean(
+            stock=stock,
+            title=title,
+            description=description,
+            sentiment=sentiment,
+            matched_terms=matched_terms,
+            translate_enabled=self.translate_news,
+            provider=self.translation_provider,
+            timeout=self.translation_timeout,
+            max_chars=self.news_summary_max_chars,
+        )
+        return NewsItem(
+            symbol=stock.symbol,
+            name_ko=stock.name_ko,
+            theme=stock.theme,
+            title=summary,
+            source=source or provider,
+            published_at=published_at.isoformat(timespec="seconds"),
+            link=link,
+            sentiment=sentiment,
+            impact_score=impact_score,
+            matched_terms=matched_terms,
+            provider=provider,
+            original_title=title,
+            original_description=description,
+            summary_ko=summary,
+        )
 
     def build_message(self, prices: List[PriceSnapshot], news: List[NewsItem]) -> str:
         generated = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -331,9 +480,10 @@ class AIThemeBriefBot:
             lines.append("- 최근 감지 뉴스 없음")
         for item in news[: self.max_total_news]:
             terms = ", ".join(item.matched_terms[:3]) or "키워드 없음"
+            summary = item.summary_ko or item.title
             lines.append(
-                f"- [{item.name_ko}({item.symbol})/{item.sentiment.upper()}] {item.title} "
-                f"({item.source}, {item.published_at}, {terms})"
+                f"- [{item.name_ko}({item.symbol})/{item.sentiment.upper()}/{item.provider or item.source}] "
+                f"{summary} ({item.source}, {item.published_at}, {terms})"
             )
 
         lines.extend(["", "🚫 직접 상장 티커 없음"])
@@ -421,6 +571,157 @@ def score_news_title(title: str) -> tuple[str, float, List[str]]:
     return sentiment, round(score, 1), risk + positive
 
 
+def summarize_news_to_korean(
+    stock: ThemeStock,
+    title: str,
+    description: str,
+    sentiment: str,
+    matched_terms: List[str],
+    translate_enabled: bool,
+    provider: str,
+    timeout: float,
+    max_chars: int,
+) -> str:
+    source_text = title
+    if len(source_text) < 70 and description:
+        source_text = f"{source_text} - {compact_text(description, 160)}"
+    source_text = compact_text(source_text, 360)
+    translated = translate_text_to_korean(
+        source_text,
+        enabled=translate_enabled,
+        provider=provider,
+        timeout=timeout,
+    )
+    if not translated:
+        translated = fallback_news_summary(title, sentiment, matched_terms)
+    sentiment_label = {"positive": "긍정", "risk": "리스크", "watch": "관찰"}.get(sentiment, "관찰")
+    terms = ", ".join(matched_terms[:3])
+    suffix = f" / 핵심 키워드: {terms}" if terms else ""
+    return compact_text(f"{stock.name_ko} 관련 {sentiment_label} 뉴스: {translated}{suffix}", max_chars)
+
+
+def translate_text_to_korean(text: str, enabled: bool, provider: str, timeout: float) -> str:
+    text = compact_text(clean_html_text(text), 440)
+    if not text:
+        return ""
+    if contains_korean(text):
+        return text
+    if not enabled:
+        return ""
+    if provider == "mymemory":
+        translated = translate_with_mymemory(text, timeout)
+        if translated:
+            return translated
+    return ""
+
+
+def translate_with_mymemory(text: str, timeout: float) -> str:
+    text = compact_text(text, 440)
+    try:
+        response = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text, "langpair": "en|ko"},
+            timeout=max(2.0, timeout),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = clean_html_text(str(payload.get("responseData", {}).get("translatedText", "")))
+        lowered = translated.lower()
+        invalid_markers = ("query length limit exceeded", "invalid", "too many requests", "translation failed")
+        if translated and translated.lower() != text.lower() and not any(marker in lowered for marker in invalid_markers):
+            return translated
+    except Exception as exc:
+        logger.debug("뉴스 번역 실패: %s", exc)
+    return ""
+
+
+def fallback_news_summary(text: str, sentiment: str, matched_terms: List[str]) -> str:
+    clean = compact_text(clean_html_text(text), 180)
+    replacements = {
+        "earnings": "실적",
+        "revenue": "매출",
+        "guidance": "가이던스",
+        "outlook": "전망",
+        "analyst": "애널리스트",
+        "upgrade": "투자의견 상향",
+        "downgrade": "투자의견 하향",
+        "partnership": "파트너십",
+        "contract": "계약",
+        "order": "수주",
+        "data center": "데이터센터",
+        "ai server": "AI 서버",
+        "blackwell": "Blackwell",
+        "gpu": "GPU",
+        "robotics": "로보틱스",
+        "lawsuit": "소송",
+        "regulation": "규제",
+        "delay": "지연",
+        "margin": "마진",
+    }
+    lowered = clean.lower()
+    detected = [ko for en, ko in replacements.items() if en in lowered]
+    detected.extend(matched_terms[:3])
+    detected = list(dict.fromkeys(detected))
+    label = {"positive": "호재 가능성", "risk": "리스크 가능성", "watch": "관찰 필요"}.get(sentiment, "관찰 필요")
+    keyword_text = f" 감지 키워드: {', '.join(detected[:5])}." if detected else ""
+    return f"{label}.{keyword_text} 원문 핵심: {clean}"
+
+
+def normalize_news_title(value: str, source: str = "") -> str:
+    title = clean_html_text(value)
+    if source:
+        for separator in (" - ", " | "):
+            suffix = f"{separator}{source}"
+            if title.endswith(suffix):
+                title = title[: -len(suffix)].strip()
+    return title
+
+
+def clean_html_text(value: str) -> str:
+    text = unescape(value or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def contains_korean(value: str) -> bool:
+    return bool(re.search(r"[가-힣]", value or ""))
+
+
+def compact_text(value: str, max_chars: int) -> str:
+    text = re.sub(r"\s+", " ", (value or "")).strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def dedupe_news_items(items: List[NewsItem]) -> List[NewsItem]:
+    deduped: Dict[str, NewsItem] = {}
+    for item in items:
+        key_source = item.original_title or item.title or item.link
+        key = re.sub(r"[^a-z0-9가-힣]+", "", key_source.lower())
+        if not key:
+            key = item.link
+        existing = deduped.get(key)
+        if existing is None or item.impact_score > existing.impact_score:
+            deduped[key] = item
+    return list(deduped.values())
+
+
+def is_relevant_news(stock: ThemeStock, title: str, description: str) -> bool:
+    text = f"{title} {description}".lower()
+    aliases = STOCK_NEWS_ALIASES.get(stock.symbol, [])
+    for alias in aliases:
+        alias = alias.lower().strip()
+        if not alias:
+            continue
+        pattern = rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
 def parse_news_datetime(value: str) -> datetime:
     try:
         parsed = parsedate_to_datetime(value)
@@ -469,6 +770,18 @@ def env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_list(name: str, default: str) -> List[str]:
+    value = os.getenv(name, default)
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
 
 
 if __name__ == "__main__":

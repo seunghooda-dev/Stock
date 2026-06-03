@@ -327,7 +327,14 @@ AI_THEME_BRIEF_NEWS_LOOKBACK_HOURS=36
 AI_THEME_BRIEF_MAX_NEWS_PER_SYMBOL=1
 AI_THEME_BRIEF_MAX_TOTAL_NEWS=12
 AI_THEME_BRIEF_PRICE_PERIOD=1mo
+AI_THEME_BRIEF_NEWS_SOURCES=yahoo,google
+AI_THEME_BRIEF_TRANSLATE_NEWS=true
+AI_THEME_BRIEF_TRANSLATION_PROVIDER=mymemory
+AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS=8
+AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS=220
 ```
+
+뉴스는 `AI_THEME_BRIEF_NEWS_SOURCES` 순서대로 Yahoo Finance RSS와 Google News RSS에서 수집합니다. 영문 뉴스 제목/요약문은 한국어로 변환해 텔레그램에 표시하고, 원문 제목과 원문 설명은 `cache/ai_theme_brief_latest.json`에 함께 보관합니다. 번역 API가 실패하면 브리프 실행은 중단하지 않고 금융 키워드 기반 한국어 요약으로 대체합니다.
 
 실행:
 
