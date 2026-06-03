@@ -34,7 +34,9 @@ AI_THEME_BRIEF_TRANSLATE_NEWS = True
 AI_THEME_BRIEF_TRANSLATION_PROVIDER = "mymemory"
 AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS = 8.0
 AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS = 220
+AI_THEME_BRIEF_HISTORY_DAYS = 7
 AI_THEME_BRIEF_CACHE_FILE = Path("cache") / "ai_theme_brief_latest.json"
+AI_THEME_BRIEF_HISTORY_FILE = Path("cache") / "ai_theme_brief_history.jsonl"
 AI_THEME_BRIEF_LOG_FILE = Path("logs") / "ai_theme_brief.log"
 
 
@@ -83,6 +85,29 @@ class NewsItem:
     original_title: str = ""
     original_description: str = ""
     summary_ko: str = ""
+    translation_status: str = ""
+    reliability_score: float = 0.0
+    reliability_grade: str = "C"
+    reliability_reasons: List[str] = field(default_factory=list)
+    related_symbols: List[str] = field(default_factory=list)
+    related_names: List[str] = field(default_factory=list)
+    duplicate_count: int = 1
+
+
+@dataclass
+class BriefDiagnostics:
+    price_success_count: int = 0
+    price_failure_count: int = 0
+    raw_news_count: int = 0
+    final_news_count: int = 0
+    duplicate_group_count: int = 0
+    news_source_success: Dict[str, int] = field(default_factory=dict)
+    news_source_failure: Dict[str, int] = field(default_factory=dict)
+    provider_item_counts: Dict[str, int] = field(default_factory=dict)
+    sentiment_counts: Dict[str, int] = field(default_factory=dict)
+    translation_status_counts: Dict[str, int] = field(default_factory=dict)
+    reliability_grade_counts: Dict[str, int] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
 
 
 AI_THEME_STOCKS: List[ThemeStock] = [
@@ -253,6 +278,8 @@ class AIThemeBriefBot:
             "AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS",
             AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS,
         )
+        self.history_days = env_int("AI_THEME_BRIEF_HISTORY_DAYS", AI_THEME_BRIEF_HISTORY_DAYS)
+        self.stats = BriefDiagnostics()
         self.telegram = TelegramClient(
             token=TELEGRAM_TOKEN or os.getenv("TELEGRAM_TOKEN", ""),
             chat_id=TELEGRAM_CHAT_ID or os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -260,27 +287,45 @@ class AIThemeBriefBot:
 
     def run_once(self) -> None:
         logger.info("AI 테마 브리프 생성 시작")
+        self.stats = BriefDiagnostics()
         prices = [self.fetch_price(stock) for stock in AI_THEME_STOCKS]
+        self.stats.price_success_count = sum(1 for item in prices if item.status == "ok")
+        self.stats.price_failure_count = len(prices) - self.stats.price_success_count
         news: List[NewsItem] = []
         for stock in AI_THEME_STOCKS:
             news.extend(self.fetch_news(stock)[: self.max_news_per_symbol])
             time.sleep(self.request_delay)
-            if len(news) >= self.max_total_news:
-                break
-        news = sorted(news, key=lambda item: (item.impact_score, item.published_at), reverse=True)[: self.max_total_news]
+        self.stats.raw_news_count = len(news)
+        news = group_related_news(news)
+        news = sorted(
+            news,
+            key=lambda item: (item.impact_score, item.reliability_score, item.published_at),
+            reverse=True,
+        )[: self.max_total_news]
+        self.update_final_diagnostics(news)
+        previous_history = read_recent_history(AI_THEME_BRIEF_HISTORY_FILE, self.history_days)
+        mention_rank = build_mention_rank(previous_history, news)
+        self.stats.warnings = build_operational_warnings(self.stats, news)
         payload = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "run_time": self.run_time,
+            "dry_run": self.dry_run,
+            "diagnostics": asdict(self.stats),
             "prices": [asdict(item) for item in prices],
             "news": [asdict(item) for item in news],
+            "mention_rank_7d": mention_rank,
             "private_or_indirect": PRIVATE_OR_INDIRECT,
         }
         write_json(AI_THEME_BRIEF_CACHE_FILE, payload)
-        message = self.build_message(prices, news)
+        if not self.dry_run:
+            append_history(AI_THEME_BRIEF_HISTORY_FILE, payload, self.history_days)
+        message = self.build_message(prices, news, self.stats, mention_rank)
         if self.dry_run:
             print(message)
         else:
-            self.telegram.send(message)
+            sent_ok = self.telegram.send(message)
+            if not sent_ok:
+                logger.error("AI 테마 브리프 텔레그램 전송 실패")
         logger.info("AI 테마 브리프 생성 완료. 가격 %d개, 뉴스 %d개", len(prices), len(news))
 
     def fetch_price(self, stock: ThemeStock) -> PriceSnapshot:
@@ -324,10 +369,12 @@ class AIThemeBriefBot:
         url = self.YAHOO_FINANCE_RSS_URL.format(symbol=quote_plus(stock.symbol))
         cutoff = datetime.now() - timedelta(hours=max(1, self.news_lookback_hours))
         candidates: List[dict] = []
+        provider = "Yahoo Finance"
         try:
             response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
             response.raise_for_status()
             root = ET.fromstring(response.content)
+            increment_counter(self.stats.news_source_success, provider)
             for item in root.findall(".//item"):
                 title = normalize_news_title(item.findtext("title") or "")
                 description = clean_html_text(item.findtext("description") or "")
@@ -338,7 +385,9 @@ class AIThemeBriefBot:
                 if not is_relevant_news(stock, title, description):
                     continue
                 source = (item.findtext("source") or "Yahoo Finance").strip()
-                _, impact_score, _ = score_news_title(f"{title} {description}")
+                sentiment, impact_score, _ = score_news_title(f"{title} {description}")
+                if sentiment == "risk" and not has_title_company_mention(stock, title):
+                    continue
                 candidates.append(
                     {
                         "title": title,
@@ -346,11 +395,12 @@ class AIThemeBriefBot:
                         "source": source,
                         "published_at": published_at,
                         "link": link,
-                        "provider": "Yahoo Finance",
+                        "provider": provider,
                         "impact_score": impact_score,
                     }
                 )
         except Exception as exc:
+            increment_counter(self.stats.news_source_failure, provider)
             logger.debug("%s(%s) Yahoo Finance 뉴스 조회 실패: %s", stock.name_ko, stock.symbol, exc)
         return self.build_top_news_items(stock, candidates)
 
@@ -359,10 +409,12 @@ class AIThemeBriefBot:
         url = self.GOOGLE_NEWS_URL.format(query=quote_plus(query))
         cutoff = datetime.now() - timedelta(hours=max(1, self.news_lookback_hours))
         candidates: List[dict] = []
+        provider = "Google News"
         try:
             response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
             response.raise_for_status()
             root = ET.fromstring(response.content)
+            increment_counter(self.stats.news_source_success, provider)
             for item in root.findall(".//item"):
                 source = (item.findtext("source") or "Google News").strip()
                 title = normalize_news_title(item.findtext("title") or "", source)
@@ -373,7 +425,9 @@ class AIThemeBriefBot:
                     continue
                 if not is_relevant_news(stock, title, description):
                     continue
-                _, impact_score, _ = score_news_title(f"{title} {description}")
+                sentiment, impact_score, _ = score_news_title(f"{title} {description}")
+                if sentiment == "risk" and not has_title_company_mention(stock, title):
+                    continue
                 candidates.append(
                     {
                         "title": title,
@@ -381,11 +435,12 @@ class AIThemeBriefBot:
                         "source": source,
                         "published_at": published_at,
                         "link": link,
-                        "provider": "Google News",
+                        "provider": provider,
                         "impact_score": impact_score,
                     }
                 )
         except Exception as exc:
+            increment_counter(self.stats.news_source_failure, provider)
             logger.debug("%s(%s) Google News 뉴스 조회 실패: %s", stock.name_ko, stock.symbol, exc)
         return self.build_top_news_items(stock, candidates)
 
@@ -417,7 +472,7 @@ class AIThemeBriefBot:
     ) -> NewsItem:
         scoring_text = f"{title} {description}"
         sentiment, impact_score, matched_terms = score_news_title(scoring_text)
-        summary = summarize_news_to_korean(
+        summary, translation_status = summarize_news_to_korean(
             stock=stock,
             title=title,
             description=description,
@@ -427,6 +482,14 @@ class AIThemeBriefBot:
             provider=self.translation_provider,
             timeout=self.translation_timeout,
             max_chars=self.news_summary_max_chars,
+        )
+        reliability_score, reliability_grade, reliability_reasons = score_news_reliability(
+            stock=stock,
+            title=title,
+            description=description,
+            provider=provider,
+            published_at=published_at,
+            matched_terms=matched_terms,
         )
         return NewsItem(
             symbol=stock.symbol,
@@ -443,14 +506,42 @@ class AIThemeBriefBot:
             original_title=title,
             original_description=description,
             summary_ko=summary,
+            translation_status=translation_status,
+            reliability_score=reliability_score,
+            reliability_grade=reliability_grade,
+            reliability_reasons=reliability_reasons,
+            related_symbols=[stock.symbol],
+            related_names=[f"{stock.name_ko}({stock.symbol})"],
         )
 
-    def build_message(self, prices: List[PriceSnapshot], news: List[NewsItem]) -> str:
+    def update_final_diagnostics(self, news: List[NewsItem]) -> None:
+        self.stats.final_news_count = len(news)
+        self.stats.duplicate_group_count = sum(max(0, item.duplicate_count - 1) for item in news)
+        self.stats.provider_item_counts = count_by(news, "provider")
+        self.stats.sentiment_counts = count_by(news, "sentiment")
+        self.stats.translation_status_counts = count_by(news, "translation_status")
+        self.stats.reliability_grade_counts = count_by(news, "reliability_grade")
+
+    def build_message(
+        self,
+        prices: List[PriceSnapshot],
+        news: List[NewsItem],
+        stats: BriefDiagnostics,
+        mention_rank: List[dict],
+    ) -> str:
         generated = datetime.now().strftime("%Y-%m-%d %H:%M")
         lines = [
             "🧠 AI 밸류체인 주식 브리프",
             f"🗓 {generated} KST",
             "범위: 사용자가 지정한 NVIDIA AI 인프라/소프트웨어/디바이스/로보틱스/서버 관련 상장주",
+            "",
+            "📊 실행 상태",
+            f"- 뉴스 {stats.final_news_count}건 / 원본 후보 {stats.raw_news_count}건 / 중복 묶음 {stats.duplicate_group_count}건",
+            f"- 소스: {format_counter(stats.provider_item_counts)}",
+            f"- 번역: {format_translation_counter(stats.translation_status_counts)}",
+            f"- 신뢰도: {format_counter(stats.reliability_grade_counts)}",
+            f"- 데이터: 가격 성공 {stats.price_success_count}개, 실패 {stats.price_failure_count}개 / "
+            f"뉴스 조회 실패 {sum(stats.news_source_failure.values())}회",
             "",
             "📌 가격 변화 상위",
         ]
@@ -475,21 +566,48 @@ class AIThemeBriefBot:
             if compact:
                 lines.append(f"- {theme}: {compact}")
 
-        lines.extend(["", "📰 관련 뉴스"])
-        if not news:
-            lines.append("- 최근 감지 뉴스 없음")
-        for item in news[: self.max_total_news]:
-            terms = ", ".join(item.matched_terms[:3]) or "키워드 없음"
-            summary = item.summary_ko or item.title
+        lines.extend(["", "🚨 리스크 뉴스"])
+        self.append_news_section(lines, news, "risk")
+        lines.extend(["", "📈 긍정 뉴스"])
+        self.append_news_section(lines, news, "positive")
+        lines.extend(["", "👀 관찰 뉴스"])
+        self.append_news_section(lines, news, "watch")
+
+        lines.extend(["", "📚 7일 반복 언급"])
+        if not mention_rank:
+            lines.append("- 누적 히스토리 없음")
+        for item in mention_rank[:5]:
             lines.append(
-                f"- [{item.name_ko}({item.symbol})/{item.sentiment.upper()}/{item.provider or item.source}] "
-                f"{summary} ({item.source}, {item.published_at}, {terms})"
+                f"- {item['name']} {item['total']}회 "
+                f"(긍정 {item.get('positive', 0)}, 리스크 {item.get('risk', 0)}, 관찰 {item.get('watch', 0)})"
             )
+
+        lines.extend(["", "⚠️ 운영 경고"])
+        if not stats.warnings:
+            lines.append("- 감지된 운영 경고 없음")
+        else:
+            lines.extend(f"- {warning}" for warning in stats.warnings)
 
         lines.extend(["", "🚫 직접 상장 티커 없음"])
         lines.extend(f"- {item}" for item in PRIVATE_OR_INDIRECT)
         lines.extend(["", "※ 자동 요약입니다. 매수/매도 추천이 아니라 지정 테마 관찰 리포트입니다."])
         return "\n".join(lines)
+
+    def append_news_section(self, lines: List[str], news: List[NewsItem], sentiment: str) -> None:
+        selected = [item for item in news if item.sentiment == sentiment]
+        if not selected:
+            lines.append("- 없음")
+            return
+        for item in selected:
+            terms = ", ".join(item.matched_terms[:3]) or "키워드 없음"
+            summary = item.summary_ko or item.title
+            related = ", ".join(item.related_names[:4]) if item.related_names else f"{item.name_ko}({item.symbol})"
+            if len(item.related_names) > 4:
+                related += f" 외 {len(item.related_names) - 4}"
+            lines.append(
+                f"- [{item.reliability_grade}/{item.provider or item.source}] {summary} "
+                f"/ 관련: {related} / 출처: {item.source}, {item.published_at}, {terms}"
+            )
 
 
 class TelegramClient:
@@ -581,12 +699,12 @@ def summarize_news_to_korean(
     provider: str,
     timeout: float,
     max_chars: int,
-) -> str:
+) -> tuple[str, str]:
     source_text = title
     if len(source_text) < 70 and description:
         source_text = f"{source_text} - {compact_text(description, 160)}"
     source_text = compact_text(source_text, 360)
-    translated = translate_text_to_korean(
+    translated, translation_status = translate_text_to_korean(
         source_text,
         enabled=translate_enabled,
         provider=provider,
@@ -594,25 +712,100 @@ def summarize_news_to_korean(
     )
     if not translated:
         translated = fallback_news_summary(title, sentiment, matched_terms)
+        if translation_status != "disabled":
+            translation_status = "fallback"
     sentiment_label = {"positive": "긍정", "risk": "리스크", "watch": "관찰"}.get(sentiment, "관찰")
     terms = ", ".join(matched_terms[:3])
     suffix = f" / 핵심 키워드: {terms}" if terms else ""
-    return compact_text(f"{stock.name_ko} 관련 {sentiment_label} 뉴스: {translated}{suffix}", max_chars)
+    return compact_text(f"{stock.name_ko} 관련 {sentiment_label} 뉴스: {translated}{suffix}", max_chars), translation_status
 
 
-def translate_text_to_korean(text: str, enabled: bool, provider: str, timeout: float) -> str:
+def translate_text_to_korean(text: str, enabled: bool, provider: str, timeout: float) -> tuple[str, str]:
     text = compact_text(clean_html_text(text), 440)
     if not text:
-        return ""
+        return "", "empty"
     if contains_korean(text):
-        return text
+        return text, "ko_source"
     if not enabled:
-        return ""
-    if provider == "mymemory":
-        translated = translate_with_mymemory(text, timeout)
+        return "", "disabled"
+    for provider_name in expand_translation_providers(provider):
+        if provider_name == "mymemory":
+            translated = translate_with_mymemory(text, timeout)
+        elif provider_name == "google":
+            translated = translate_with_google(text, timeout)
+        else:
+            translated = ""
         if translated:
-            return translated
-    return ""
+            return translated, f"translated:{provider_name}"
+    return "", "fallback"
+
+
+def expand_translation_providers(provider: str) -> List[str]:
+    providers = [item.strip().lower() for item in provider.split(",") if item.strip()]
+    if not providers:
+        providers = ["mymemory"]
+    if "google" not in providers:
+        providers.append("google")
+    return providers
+
+
+def score_news_reliability(
+    stock: ThemeStock,
+    title: str,
+    description: str,
+    provider: str,
+    published_at: datetime,
+    matched_terms: List[str],
+) -> tuple[float, str, List[str]]:
+    text = f"{title} {description}".lower()
+    score = 0.0
+    reasons: List[str] = []
+    ticker = stock.symbol.split(".")[0].lower()
+    if ticker and not ticker.isdigit() and re.search(rf"(?<![a-z0-9]){re.escape(ticker)}(?![a-z0-9])", text):
+        score += 30
+        reasons.append("티커 직접 언급")
+
+    aliases = STOCK_NEWS_ALIASES.get(stock.symbol, [])
+    matched_aliases = []
+    for alias in aliases:
+        alias = alias.lower().strip()
+        if alias and re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text):
+            matched_aliases.append(alias)
+    if matched_aliases:
+        score += 25
+        reasons.append("회사/핵심 별칭 언급")
+
+    if matched_terms:
+        score += min(20, 8 + len(matched_terms) * 4)
+        reasons.append("AI/실적/리스크 키워드")
+
+    provider_score = 10 if provider == "Yahoo Finance" else 8 if provider == "Google News" else 5
+    score += provider_score
+    reasons.append(provider)
+
+    age_hours = max(0.0, (datetime.now() - published_at).total_seconds() / 3600)
+    if age_hours <= 6:
+        score += 10
+        reasons.append("6시간 이내")
+    elif age_hours <= 24:
+        score += 7
+        reasons.append("24시간 이내")
+    else:
+        score += 4
+        reasons.append("최근 뉴스")
+
+    if description:
+        score += 5
+        reasons.append("요약문 포함")
+
+    score = round(min(100.0, score), 1)
+    if score >= 75:
+        grade = "A"
+    elif score >= 55:
+        grade = "B"
+    else:
+        grade = "C"
+    return score, grade, reasons
 
 
 def translate_with_mymemory(text: str, timeout: float) -> str:
@@ -633,6 +826,26 @@ def translate_with_mymemory(text: str, timeout: float) -> str:
             return translated
     except Exception as exc:
         logger.debug("뉴스 번역 실패: %s", exc)
+    return ""
+
+
+def translate_with_google(text: str, timeout: float) -> str:
+    text = compact_text(text, 440)
+    try:
+        response = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "en", "tl": "ko", "dt": "t", "q": text},
+            timeout=max(2.0, timeout),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = "".join(part[0] for part in payload[0] if part and part[0])
+        translated = clean_html_text(translated)
+        if translated and translated.lower() != text.lower():
+            return translated
+    except Exception as exc:
+        logger.debug("Google 뉴스 번역 실패: %s", exc)
     return ""
 
 
@@ -699,14 +912,61 @@ def compact_text(value: str, max_chars: int) -> str:
 def dedupe_news_items(items: List[NewsItem]) -> List[NewsItem]:
     deduped: Dict[str, NewsItem] = {}
     for item in items:
-        key_source = item.original_title or item.title or item.link
-        key = re.sub(r"[^a-z0-9가-힣]+", "", key_source.lower())
-        if not key:
-            key = item.link
+        key = canonical_news_key(item)
         existing = deduped.get(key)
         if existing is None or item.impact_score > existing.impact_score:
             deduped[key] = item
     return list(deduped.values())
+
+
+def group_related_news(items: List[NewsItem]) -> List[NewsItem]:
+    groups: Dict[str, List[NewsItem]] = {}
+    for item in items:
+        groups.setdefault(canonical_news_key(item), []).append(item)
+
+    grouped: List[NewsItem] = []
+    for group_items in groups.values():
+        best = sorted(
+            group_items,
+            key=lambda item: (item.impact_score, item.reliability_score, item.published_at),
+            reverse=True,
+        )[0]
+        symbols: List[str] = []
+        names: List[str] = []
+        terms: List[str] = []
+        for item in group_items:
+            for symbol in item.related_symbols or [item.symbol]:
+                if symbol not in symbols:
+                    symbols.append(symbol)
+            for name in item.related_names or [f"{item.name_ko}({item.symbol})"]:
+                if name not in names:
+                    names.append(name)
+            for term in item.matched_terms:
+                if term not in terms:
+                    terms.append(term)
+        best.related_symbols = symbols
+        best.related_names = names
+        best.matched_terms = terms
+        best.duplicate_count = len(group_items)
+        if len(group_items) > 1:
+            best.impact_score = round(best.impact_score + min(3.0, (len(group_items) - 1) * 0.5), 1)
+            best.reliability_score = round(min(100.0, best.reliability_score + min(10.0, (len(group_items) - 1) * 2.0)), 1)
+            if best.reliability_score >= 75:
+                best.reliability_grade = "A"
+            elif best.reliability_score >= 55:
+                best.reliability_grade = "B"
+            else:
+                best.reliability_grade = "C"
+            if "복수 관련 종목" not in best.reliability_reasons:
+                best.reliability_reasons.append("복수 관련 종목")
+        grouped.append(best)
+    return grouped
+
+
+def canonical_news_key(item: NewsItem) -> str:
+    key_source = item.original_title or item.title or item.link
+    key = re.sub(r"[^a-z0-9가-힣]+", "", key_source.lower())
+    return key or item.link
 
 
 def is_relevant_news(stock: ThemeStock, title: str, description: str) -> bool:
@@ -720,6 +980,133 @@ def is_relevant_news(stock: ThemeStock, title: str, description: str) -> bool:
         if re.search(pattern, text):
             return True
     return False
+
+
+def has_title_company_mention(stock: ThemeStock, title: str) -> bool:
+    text = title.lower()
+    aliases = STOCK_NEWS_ALIASES.get(stock.symbol, [])
+    ticker = stock.symbol.split(".")[0].lower()
+    if ticker and not ticker.isdigit():
+        aliases = [ticker] + aliases
+    for alias in aliases:
+        alias = alias.lower().strip()
+        if not alias:
+            continue
+        if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text):
+            return True
+    return False
+
+
+def build_operational_warnings(stats: BriefDiagnostics, news: List[NewsItem]) -> List[str]:
+    warnings: List[str] = []
+    if stats.price_failure_count:
+        warnings.append(f"가격 데이터 실패 {stats.price_failure_count}개가 있습니다.")
+    if stats.news_source_failure:
+        warnings.append(f"뉴스 소스 조회 실패: {format_counter(stats.news_source_failure)}")
+    if not news:
+        warnings.append("최근 뉴스가 0건입니다. RSS 소스나 조회 범위를 확인하세요.")
+    fallback_count = stats.translation_status_counts.get("fallback", 0)
+    translated_total = sum(stats.translation_status_counts.values())
+    if translated_total and fallback_count / translated_total >= 0.5:
+        warnings.append(f"번역 대체요약 비중이 높습니다. fallback {fallback_count}/{translated_total}")
+    c_count = stats.reliability_grade_counts.get("C", 0)
+    if news and c_count / len(news) >= 0.5:
+        warnings.append(f"신뢰도 C 뉴스 비중이 높습니다. C {c_count}/{len(news)}")
+    return warnings
+
+
+def build_mention_rank(history_entries: List[dict], current_news: List[NewsItem]) -> List[dict]:
+    stock_names = {stock.symbol: f"{stock.name_ko}({stock.symbol})" for stock in AI_THEME_STOCKS}
+    rank: Dict[str, dict] = {}
+
+    def add_mention(symbol: str, sentiment: str) -> None:
+        if not symbol:
+            return
+        item = rank.setdefault(
+            symbol,
+            {"symbol": symbol, "name": stock_names.get(symbol, symbol), "total": 0, "positive": 0, "risk": 0, "watch": 0},
+        )
+        item["total"] += 1
+        item[sentiment if sentiment in {"positive", "risk", "watch"} else "watch"] += 1
+
+    for entry in history_entries:
+        for item in entry.get("news", []):
+            symbols = item.get("related_symbols") or [item.get("symbol", "")]
+            for symbol in set(symbols):
+                add_mention(symbol, item.get("sentiment", "watch"))
+
+    for item in current_news:
+        for symbol in set(item.related_symbols or [item.symbol]):
+            add_mention(symbol, item.sentiment)
+
+    return sorted(rank.values(), key=lambda item: (item["total"], item["positive"], -item["risk"]), reverse=True)
+
+
+def read_recent_history(path: Path, days: int) -> List[dict]:
+    if not path.exists():
+        return []
+    cutoff = datetime.now() - timedelta(days=max(1, days))
+    entries: List[dict] = []
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    generated_at = datetime.fromisoformat(str(entry.get("generated_at", "")))
+                    if generated_at >= cutoff and not entry.get("dry_run"):
+                        entries.append(entry)
+                except Exception:
+                    continue
+    except Exception as exc:
+        logger.warning("AI 테마 브리프 히스토리 읽기 실패: %s", exc)
+    return entries
+
+
+def append_history(path: Path, payload: dict, days: int) -> None:
+    path.parent.mkdir(exist_ok=True)
+    entries = read_recent_history(path, days)
+    entries.append(payload)
+    temp_path = path.with_name(path.name + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        for entry in entries:
+            file.write(json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n")
+    temp_path.replace(path)
+
+
+def count_by(items: List[NewsItem], attr: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in items:
+        value = str(getattr(item, attr, "") or "unknown")
+        increment_counter(counts, value)
+    return counts
+
+
+def increment_counter(counter: Dict[str, int], key: str, amount: int = 1) -> None:
+    counter[key] = counter.get(key, 0) + amount
+
+
+def format_counter(counter: Dict[str, int]) -> str:
+    if not counter:
+        return "없음"
+    return ", ".join(f"{key} {value}" for key, value in sorted(counter.items()))
+
+
+def format_translation_counter(counter: Dict[str, int]) -> str:
+    labels = {
+        "translated": "번역성공",
+        "translated:mymemory": "번역성공(MyMemory)",
+        "translated:google": "번역성공(Google)",
+        "ko_source": "원문한국어",
+        "fallback": "대체요약",
+        "disabled": "번역꺼짐",
+        "empty": "빈문장",
+    }
+    if not counter:
+        return "없음"
+    return ", ".join(f"{labels.get(key, key)} {value}" for key, value in sorted(counter.items()))
 
 
 def parse_news_datetime(value: str) -> datetime:

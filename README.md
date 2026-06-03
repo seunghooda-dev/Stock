@@ -332,9 +332,14 @@ AI_THEME_BRIEF_TRANSLATE_NEWS=true
 AI_THEME_BRIEF_TRANSLATION_PROVIDER=mymemory
 AI_THEME_BRIEF_TRANSLATION_TIMEOUT_SECONDS=8
 AI_THEME_BRIEF_NEWS_SUMMARY_MAX_CHARS=220
+AI_THEME_BRIEF_HISTORY_DAYS=7
 ```
 
-뉴스는 `AI_THEME_BRIEF_NEWS_SOURCES` 순서대로 Yahoo Finance RSS와 Google News RSS에서 수집합니다. 영문 뉴스 제목/요약문은 한국어로 변환해 텔레그램에 표시하고, 원문 제목과 원문 설명은 `cache/ai_theme_brief_latest.json`에 함께 보관합니다. 번역 API가 실패하면 브리프 실행은 중단하지 않고 금융 키워드 기반 한국어 요약으로 대체합니다.
+뉴스는 `AI_THEME_BRIEF_NEWS_SOURCES` 순서대로 Yahoo Finance RSS와 Google News RSS에서 수집합니다. 영문 뉴스 제목/요약문은 한국어로 변환해 텔레그램에 표시하고, 원문 제목과 원문 설명은 `cache/ai_theme_brief_latest.json`에 함께 보관합니다. MyMemory 번역이 실패하면 Google 번역 공개 엔드포인트를 보조 경로로 사용하고, 그래도 실패하면 브리프 실행을 중단하지 않고 금융 키워드 기반 한국어 요약으로 대체합니다.
+
+브리프 상단에는 뉴스 수, 원본 후보 수, 중복 묶음 수, 소스별 수집 건수, 번역 상태, 신뢰도 등급, 가격/뉴스 실패 수가 표시됩니다. 뉴스는 리스크/긍정/관찰 섹션으로 분리되고, 같은 원문이 여러 종목에 걸리면 한 줄로 묶어 관련 종목을 함께 보여줍니다. 각 뉴스에는 `A/B/C` 신뢰도 등급이 붙습니다.
+
+`cache/ai_theme_brief_history.jsonl`에는 최근 실행 결과가 최대 `AI_THEME_BRIEF_HISTORY_DAYS`일 동안 누적됩니다. 이 히스토리를 이용해 텔레그램 하단의 `7일 반복 언급` 섹션에서 최근 며칠간 계속 언급되는 종목을 확인합니다. 드라이런(`--dry-run`) 결과는 최신 캐시에는 남지만 7일 히스토리에는 누적하지 않습니다.
 
 실행:
 
