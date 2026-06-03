@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ai_theme_brief_bot import AI_THEME_BRIEF_CACHE_FILE
 from stock_telegram_bot import (
     BOT_LOG_FILE,
     BOT_STATE_FILE,
@@ -40,6 +41,7 @@ class BotStatus:
     files: Dict[str, FileStatus]
     jobs: Dict[str, Dict[str, object]] = field(default_factory=dict)
     latest_research: Dict[str, object] = field(default_factory=dict)
+    ai_theme_brief: Dict[str, object] = field(default_factory=dict)
     realtime_candidates: Dict[str, object] = field(default_factory=dict)
     pending_trades: Dict[str, object] = field(default_factory=dict)
     news_alerts: Dict[str, object] = field(default_factory=dict)
@@ -68,6 +70,7 @@ def build_status(tail_lines: int = 12) -> BotStatus:
     files = {
         "bot_state": file_status(BOT_STATE_FILE),
         "latest_research": file_status(LATEST_RESEARCH_REPORT_FILE),
+        "ai_theme_brief": file_status(AI_THEME_BRIEF_CACHE_FILE),
         "realtime_candidates": file_status(REALTIME_CANDIDATE_FILE),
         "pending_trades": file_status(PENDING_TRADE_FILE),
         "news_alerts": file_status(NEWS_ALERT_FILE),
@@ -82,6 +85,7 @@ def build_status(tail_lines: int = 12) -> BotStatus:
         files=files,
         jobs=summarize_jobs(state),
         latest_research=latest_research,
+        ai_theme_brief=summarize_ai_theme_brief(read_json(AI_THEME_BRIEF_CACHE_FILE)),
         realtime_candidates=summarize_realtime_candidates(read_json(REALTIME_CANDIDATE_FILE)),
         pending_trades=summarize_pending_trades(read_json(PENDING_TRADE_FILE)),
         news_alerts=summarize_news_alerts(read_json(NEWS_ALERT_FILE)),
@@ -130,6 +134,22 @@ def print_human(status: BotStatus) -> None:
             )
     else:
         print("- 최신 리서치 파일 없음")
+    print()
+
+    brief = status.ai_theme_brief
+    print("AI Theme Brief")
+    if brief:
+        print(
+            f"- generated: {brief.get('generated_at', 'N/A')} / "
+            f"prices {brief.get('price_count', 0)} / news {brief.get('news_count', 0)}"
+        )
+        for item in brief.get("top_movers", []):
+            print(
+                f"  {item.get('name_ko')}({item.get('symbol')}) "
+                f"1D {item.get('change_1d_pct')}% / {item.get('theme')}"
+            )
+    else:
+        print("- AI 테마 브리프 파일 없음")
     print()
 
     realtime = status.realtime_candidates
@@ -247,6 +267,33 @@ def summarize_research(payload: Dict[str, object]) -> Dict[str, object]:
             }
             for item in top[:3]
             if isinstance(item, dict)
+        ],
+    }
+
+
+def summarize_ai_theme_brief(payload: Dict[str, object]) -> Dict[str, object]:
+    if not payload:
+        return {}
+    prices = payload.get("prices", []) if isinstance(payload.get("prices"), list) else []
+    news = payload.get("news", []) if isinstance(payload.get("news"), list) else []
+    priced = [
+        item
+        for item in prices
+        if isinstance(item, dict) and isinstance(item.get("change_1d_pct"), (int, float))
+    ]
+    top_movers = sorted(priced, key=lambda item: abs(float(item.get("change_1d_pct", 0))), reverse=True)[:5]
+    return {
+        "generated_at": payload.get("generated_at", ""),
+        "price_count": len(prices),
+        "news_count": len(news),
+        "top_movers": [
+            {
+                "symbol": item.get("symbol"),
+                "name_ko": item.get("name_ko"),
+                "theme": item.get("theme"),
+                "change_1d_pct": item.get("change_1d_pct"),
+            }
+            for item in top_movers
         ],
     }
 

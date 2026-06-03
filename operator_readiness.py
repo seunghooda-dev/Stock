@@ -153,6 +153,7 @@ class OperatorReadinessAuditor:
     def _check_local_files(self) -> None:
         required_files = [
             "stock_telegram_bot.py",
+            "ai_theme_brief_bot.py",
             "backtest_stock_bot.py",
             "validate_data_sources.py",
             "test_kis_connection.py",
@@ -523,6 +524,8 @@ class OperatorReadinessAuditor:
             "setup_windows_pc.bat",
             "run_stock_bot.bat",
             "run_stock_bot_headless.bat",
+            "run_ai_theme_brief_bot.bat",
+            "run_ai_theme_brief_once.bat",
             "stop_stock_bot.bat",
             "install_startup_task.bat",
             "uninstall_startup_task.bat",

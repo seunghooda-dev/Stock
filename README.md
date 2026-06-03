@@ -27,6 +27,7 @@ KOSPI/KOSDAQ 전종목 중 재무 건전성이 좋고 자산가치 대비 저평
 - `pykrx`: KRX 기준 PER/PBR/EPS/BPS 보강 및 ROE 추정
 - `yfinance`: 재무제표, 대차대조표, 손익계산서
 - `Naver Finance`: 최근 외국인/기관 순매매 데이터
+- `Google News RSS`: 지정 AI 테마 종목의 최근 뉴스 감지
 
 ## 설치
 
@@ -275,6 +276,7 @@ notepad .env
 - `logs/bot.log`: 콘솔과 별개로 남는 회전 로그 파일입니다. 파일이 커지면 자동으로 백업됩니다.
 - `cache/bot_state.json`: 최근 장마감 리서치, 실시간 스캔, 뉴스 스캔, 자동매매 실행 상태와 후보 수, 상위 추천 요약을 저장합니다.
 - `cache/latest_research_report.json`: 마지막 전체 리서치의 추천 Top 3, 내부 감시 후보, 점수/재무/기술/수급 근거, 필터별 탈락 병목을 저장합니다.
+- `cache/ai_theme_brief_latest.json`: 마지막 AI 밸류체인 아침 브리프의 가격/뉴스 요약을 저장합니다.
 - `cache/*.lock`: 같은 작업이 중복 실행되지 않도록 막는 실행 락입니다. 오래된 락은 설정 시간 이후 자동 제거됩니다.
 
 주요 JSON 캐시는 임시 파일에 먼저 기록한 뒤 교체하는 원자적 저장 방식을 사용합니다. PC 종료나 프로세스 강제 종료가 겹쳐도 `fundamentals.json`, `realtime_candidates.json`, `bot_state.json`, `latest_research_report.json` 같은 운영 파일이 반쯤 저장되는 위험을 줄입니다.
@@ -299,9 +301,43 @@ SCHEDULER_LOCK_STALE_MINUTES=720
 .\.venv\Scripts\python.exe status_stock_bot.py --json
 ```
 
-상태 대시보드는 실행 중인 봇 프로세스, 최근 작업별 성공/실패, 최신 리서치 Top 3, 실시간 후보군 수, 대기 주문, 뉴스 알림, 활성 락, 로그 마지막 줄을 보여줍니다. 최신 리서치 파일이 있으면 `유니버스 -> 재무 통과 -> 최종 후보` 경로와 `기술조건/팩터점수/투자가설/데이터품질` 등 주요 탈락 병목도 함께 표시합니다.
+상태 대시보드는 실행 중인 봇 프로세스, 최근 작업별 성공/실패, 최신 리서치 Top 3, AI 테마 브리프, 실시간 후보군 수, 대기 주문, 뉴스 알림, 활성 락, 로그 마지막 줄을 보여줍니다. 최신 리서치 파일이 있으면 `유니버스 -> 재무 통과 -> 최종 후보` 경로와 `기술조건/팩터점수/투자가설/데이터품질` 등 주요 탈락 병목도 함께 표시합니다.
 
 텔레그램 장마감 리포트 상단에는 전체 리서치 후보 수, 내부 감시 후보 수, 추천 컷 점수, 후보 분포가 표시됩니다. 상세 리포트는 `TOP 1~3`만 내려가므로 낮은 점수 후보가 추천처럼 섞이지 않습니다.
+
+## AI 밸류체인 아침 브리프
+
+`ai_theme_brief_bot.py`는 한국 주식 스캐너와 별개로, 사용자가 지정한 NVIDIA AI 밸류체인 관련 상장주만 매일 아침 8시에 텔레그램으로 정리합니다.
+
+대상 테마:
+
+- 인프라/네트워킹: NVIDIA, Marvell, CoreWeave
+- 엔터프라이즈 AI: ServiceNow, Salesforce, SAP, Palantir
+- 로컬 AI PC/디바이스: Microsoft, MediaTek
+- 물리적 AI/로보틱스: Hyundai Motor(Boston Dynamics 간접), Siemens
+- AI 서버/하드웨어: Foxconn, Quanta, Wistron, Inventec, Pegatron, Super Micro, ASUS, Gigabyte
+
+비상장 기업인 Figure AI, Agility Robotics, Boston Dynamics는 직접 매수 가능한 티커가 없으므로 별도 참고 항목으로만 표시합니다. Boston Dynamics는 현대차를 간접 노출로 추적합니다.
+
+설정:
+
+```text
+AI_THEME_BRIEF_RUN_TIME_KST=08:00
+AI_THEME_BRIEF_NEWS_LOOKBACK_HOURS=36
+AI_THEME_BRIEF_MAX_NEWS_PER_SYMBOL=1
+AI_THEME_BRIEF_MAX_TOTAL_NEWS=12
+AI_THEME_BRIEF_PRICE_PERIOD=1mo
+```
+
+실행:
+
+```powershell
+.\.venv\Scripts\python.exe ai_theme_brief_bot.py --once
+.\.venv\Scripts\python.exe ai_theme_brief_bot.py --once --dry-run
+.\.venv\Scripts\python.exe ai_theme_brief_bot.py
+```
+
+바탕화면 바로가기를 만들면 `AIThemeBrief_Run.bat`은 매일 08:00 대기 실행, `AIThemeBrief_SendOnce.bat`은 즉시 1회 전송입니다.
 
 ## 즉시 알림
 
@@ -461,6 +497,7 @@ NEWS_TRADE_BLOCK_MIN_SCORE=6
 - `DecisionPolicy`: 관심 후보/강력 후보/자동매매 가능 등급과 보류 사유 판정
 - `Notifier`: 텔레그램 리포트 전송
 - `FinancialHealthBot`: 전체 실행 흐름과 스케줄 관리
+- `ai_theme_brief_bot.py`: 지정 AI 밸류체인 종목의 가격/뉴스 아침 브리프
 - `operator_readiness.py`: 운영 PC, API, 데이터, 전략/위험 설정을 한 번에 점검하는 실행 전 감사 도구
 
 ## 참고
